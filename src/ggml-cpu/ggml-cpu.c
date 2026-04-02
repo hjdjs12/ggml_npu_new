@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
+#include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -13,7 +14,6 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
-#include "common.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -74,9 +74,6 @@
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
-
-// precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
-float ggml_table_f32_e8m0_half[1 << 8];
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -267,12 +264,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_MXFP4] = {
         .from_float               = quantize_row_mxfp4,
         .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_NVFP4] = {
-        .from_float               = quantize_row_nvfp4,
-        .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
@@ -552,6 +543,17 @@ struct ggml_state {
 };
 
 static struct ggml_state g_state = {0};
+
+// NPU support
+#ifdef GGML_USE_NPU
+#include "ggml-cpu-matmul-npu.h"
+static bool g_npu_available = true;
+// 全局计数器，用于标记每次矩阵乘法的序号
+static _Atomic int g_matmul_counter = 0;
+static _Atomic uint64_t g_matmul_dump_seq = 0;
+#else
+static _Atomic int g_matmul_counter = 0;
+#endif
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
@@ -1239,6 +1241,334 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+#ifdef GGML_USE_NPU
+    if (params->ith == 0) {
+        const uint64_t dump_seq = (uint64_t) atomic_fetch_add_explicit(&g_matmul_dump_seq, 1, memory_order_relaxed) + 1;
+        ggml_npu_set_dump_seq(dump_seq);
+    }
+
+    ggml_barrier(params->threadpool);
+    // NPU 模式：只使用单线程执行，其他线程直接返回
+    int ret = ggml_can_use_npu(src0, src1);
+    if (g_npu_available && ret) {
+        if(ret == 1){
+            if (params->ith == 0) {
+                // 线程 0：使用 NPU 执行
+                int op_num = atomic_fetch_add(&g_matmul_counter, 1) + 1;
+                printf("\n[MATMUL #%d] Using NPU (single thread mode)\n", op_num);
+                printf("  src0 (weight): %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src0->name, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->type);
+                printf("  src1 (input):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src1->name, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], src1->type);
+                printf("  dst (output):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", dst->name, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], dst->type);
+
+
+                struct ggml_tensor* cur = src0;
+                while (cur != NULL) {
+                    // 1. 打印基础信息：包括 Tensor 名称、类型以及核心的 Operation 名称
+                    // 使用 ggml_op_name() 将枚举转换为可读字符串
+                    printf("\n[DEBUG] Tensor: %-20s | Op: %-12s | Type: %d | Data: %p\n", 
+                            cur->name[0] ? cur->name : "unnamed", 
+                            ggml_op_name(cur->op), 
+                            (int)cur->type, 
+                            cur->data);
+
+                    // 1.1 打印维度信息 (ne)，方便查看 Tensor 形状
+                    printf("  Shape: [%lld, %lld, %lld, %lld]\n", 
+                            cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+                    // 2. 打印前 32 个元素 (仅限 FP32 类型且数据已分配)
+                    if (cur->data != NULL) {
+                        if (cur->type == GGML_TYPE_F32) {
+                            float * data_ptr = (float *)cur->data;
+                            int n_vals = (int)ggml_nelements(cur);
+                            int to_print = n_vals < 32 ? n_vals : 32;
+
+                            printf("  Data (F32): ");
+                            for (int i = 0; i < to_print; ++i) {
+                                printf("%.4f ", data_ptr[i]);
+                            }
+                            if (n_vals > 32) printf("...");
+                            printf("\n");
+                        } else {
+                            // 如果是量化类型或 F16，直接打印可能需要特定的解压函数，这里选择跳过
+                            printf("  Data: [Type %d, skipping data print]\n", (int)cur->type);
+                        }
+                    } else {
+                        printf("  Data: [NULL - Not yet allocated]\n");
+                    }
+                    
+                    // 3. 逻辑追踪与路径打印
+                    if (cur->view_src != NULL) {
+                        // 如果是 View（切片、Reshape等），它指向原始数据源，不代表计算步骤
+                        printf("  -> [VIEW] Derived from: %s (Offset: %zu)\n", 
+                                cur->view_src->name, cur->view_offs);
+                        cur = cur->view_src;
+                    } else if (cur->src[0] != NULL) {
+                        // 如果有 src[0]，说明这是一个计算节点（Op）
+                        printf("  -> [OP] Source 0: %s (Op was: %s)\n", 
+                                cur->src[0]->name, ggml_op_name(cur->op));
+                        cur = cur->src[0];
+                    } else {
+                        printf("  -> Reached Root (Input/Weight).\n");
+                        break;
+                    }
+                }
+                printf("//////////////////////////////////////////////////////////\n");
+                cur = src1;
+                while (cur != NULL) {
+                    // 1. 打印基础信息：包括 Tensor 名称、类型以及核心的 Operation 名称
+                    // 使用 ggml_op_name() 将枚举转换为可读字符串
+                    printf("\n[DEBUG] Tensor: %-20s | Op: %-12s | Type: %d | Data: %p\n", 
+                            cur->name[0] ? cur->name : "unnamed", 
+                            ggml_op_name(cur->op), 
+                            (int)cur->type, 
+                            cur->data);
+
+                    // 1.1 打印维度信息 (ne)，方便查看 Tensor 形状
+                    printf("  Shape: [%lld, %lld, %lld, %lld]\n", 
+                            cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+                    // 2. 打印前 32 个元素 (仅限 FP32 类型且数据已分配)
+                    if (cur->data != NULL) {
+                        if (cur->type == GGML_TYPE_F32) {
+                            float * data_ptr = (float *)cur->data;
+                            int n_vals = (int)ggml_nelements(cur);
+                            int to_print = n_vals < 32 ? n_vals : 32;
+
+                            printf("  Data (F32): ");
+                            for (int i = 0; i < to_print; ++i) {
+                                printf("%.4f ", data_ptr[i]);
+                            }
+                            if (n_vals > 32) printf("...");
+                            printf("\n");
+                        } else {
+                            // 如果是量化类型或 F16，直接打印可能需要特定的解压函数，这里选择跳过
+                            printf("  Data: [Type %d, skipping data print]\n", (int)cur->type);
+                        }
+                    } else {
+                        printf("  Data: [NULL - Not yet allocated]\n");
+                    }
+                    
+                    // 3. 逻辑追踪与路径打印
+                    if (cur->view_src != NULL) {
+                        // 如果是 View（切片、Reshape等），它指向原始数据源，不代表计算步骤
+                        printf("  -> [VIEW] Derived from: %s (Offset: %zu)\n", 
+                                cur->view_src->name, cur->view_offs);
+                        cur = cur->view_src;
+                    } else if (cur->src[0] != NULL) {
+                        // 如果有 src[0]，说明这是一个计算节点（Op）
+                        printf("  -> [OP] Source 0: %s (Op was: %s)\n", 
+                                cur->src[0]->name, ggml_op_name(cur->op));
+                        cur = cur->src[0];
+                    } else {
+                        printf("  -> Reached Root (Input/Weight).\n");
+                        break;
+                    }
+                }
+
+
+                // 打印 src1 (input) 的前 64 个值 (FP32)
+                printf("[MATMUL #%d] Input (src1, first 64 floats):\n  ", op_num);
+                float* input_data = (float*)src1->data;
+                size_t input_elements = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
+                size_t input_print_count = input_elements < 64 ? input_elements : 64;
+                for (size_t i = 0; i < input_print_count; i++) {
+                    printf("%.6f ", input_data[i]);
+                    if ((i + 1) % 8 == 0) printf("\n  ");
+                }
+                printf("\n");
+                
+                // 打印 src0 (weight) 的前 64 个值 (可能是量化格式，只打印原始字节)
+                printf("[MATMUL #%d] Weight (src0, Structured Print, type=%s) data_ptr: %p:\n", op_num, ggml_type_name(src0->type),(void*)src0->data);
+
+                if (src0->type == GGML_TYPE_Q8_0) {
+                    printf("[CPU OP] src0 Weight (first 64 bytes, type=Q8_0):\n  ");
+                    
+                    // 强制转换为原始字节指针，不使用 block_q8_0 结构体解析
+                    uint8_t* raw_ptr = (uint8_t*)src0->data;
+                    
+                    // 确定打印长度（取数据总量和 64 的较小值）
+                    size_t total_bytes = ggml_nbytes(src0);
+                    size_t print_len = total_bytes < 64 ? total_bytes : 64;
+
+                    for (size_t i = 0; i < print_len; i++) {
+                        // 以两位十六进制打印，并保持对齐
+                        printf("%02x ", raw_ptr[i]);
+                        
+                        // 每 16 个字节换一行，方便对比
+                        if ((i + 1) % 16 == 0 && i < print_len - 1) {
+                            printf("\n  ");
+                        }
+                    }
+                    printf("\n");
+                }
+                
+                else if (src0->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * f16_data = (const ggml_fp16_t *)src0->data;
+                    size_t n_elements = ggml_nelements(src0);
+                    size_t print_count = n_elements < 64 ? n_elements : 64;
+
+                    printf("  Data (FP16 converted to FP32 for print):\n    ");
+                    for (size_t i = 0; i < print_count; i++) {
+                        // 使用 GGML 内置函数将 FP16 转换为 float 打印
+                        float val = ggml_fp16_to_fp32(f16_data[i]);
+                        printf("%8.4f ", val);
+                        
+                        if ((i + 1) % 8 == 0) printf("\n    ");
+                    }
+                    printf("\n");
+                }
+                else {
+                    // 其他不支持结构化打印的类型，回退到 Hex 打印
+                    printf("  [Note] Structured print not implemented for %s, falling back to Hex:\n    ", ggml_type_name(src0->type));
+                    uint8_t* raw = (uint8_t*)src0->data;
+                    size_t weight_bytes = ggml_nbytes(src0);
+                    size_t weight_print_count = weight_bytes < 64 ? weight_bytes : 64;
+                    for (size_t i = 0; i < weight_print_count; i++) {
+                        printf("%02x ", raw[i]);
+                        if ((i + 1) % 16 == 0) printf("\n    ");
+                    }
+                    printf("\n");
+                }
+                
+                char in_filename[64];
+                snprintf(in_filename, sizeof(in_filename), "inputs/%d.txt", op_num);
+                FILE *f_in = fopen(in_filename, "w");
+
+                if (f_in) {
+                    size_t in_elements = ggml_nelements(src1);
+                    if (src1->type == GGML_TYPE_F32) {
+                        float* in_ptr = (float*)src1->data;
+                        for (size_t i = 0; i < in_elements; i++) {
+                            fprintf(f_in, "%a\n", in_ptr[i]);
+                        }
+                    } 
+                    else if (src1->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t* in_ptr = (const ggml_fp16_t*)src1->data;
+                        for (size_t i = 0; i < in_elements; i++) {
+                            fprintf(f_in, "%a\n", ggml_fp16_to_fp32(in_ptr[i]));
+                        }
+                    } 
+                    else {
+                        fprintf(f_in, "Unsupported type: %s\n", ggml_type_name(src1->type));
+                    }
+                    fclose(f_in);
+                    printf("  [SAVE] Input (src1) %zu elements saved to %s\n", in_elements, in_filename);
+                } else {
+                    printf("  [ERROR] Failed to open %s. Make sure 'inputs' folder exists.\n", in_filename);
+                }
+
+
+                char weight_filename[64];
+                snprintf(weight_filename, sizeof(weight_filename), "weights/%d.txt", op_num);
+                FILE *f_w = fopen(weight_filename, "w");
+
+                if (f_w) {
+                    printf("[CPU OP #%d] src0 Weight (type=%s, bytes=%zu)\n", 
+                        op_num, ggml_type_name(src0->type), ggml_nbytes(src0));
+
+                    size_t total_bytes = ggml_nbytes(src0);
+                    uint8_t* data_ptr = (uint8_t*)src0->data;
+
+                    if (src0->type == GGML_TYPE_F32) {
+                        // F32 打印为浮点数
+                        float* f32_ptr = (float*)data_ptr;
+                        size_t n_elements = ggml_nelements(src0);
+                        for (size_t i = 0; i < n_elements; i++) {
+                            fprintf(f_w, "%a\n", f32_ptr[i]);
+                        }
+                    } 
+                    else if (src0->type == GGML_TYPE_F16) {
+                        // F16 转换后打印为浮点数
+                        const ggml_fp16_t* f16_ptr = (const ggml_fp16_t*)data_ptr;
+                        size_t n_elements = ggml_nelements(src0);
+                        for (size_t i = 0; i < n_elements; i++) {
+                            fprintf(f_w, "%a\n", ggml_fp16_to_fp32(f16_ptr[i]));
+                        }
+                    } 
+                    else {
+                        // 对于 Q8_0, Q4_0 等量化类型，直接打印原始十六进制字节
+                        // 这样可以确保即使不了解 block 结构也能进行逐字节对比
+                        for (size_t i = 0; i < total_bytes; i++) {
+                            fprintf(f_w, "%02x\n", data_ptr[i]);
+                            
+                            // 屏幕控制台只打印前 64 字节预览，避免刷屏
+                            if (i < 64) {
+                                printf("%02x ", data_ptr[i]);
+                                if ((i + 1) % 16 == 0) printf("\n  ");
+                            }
+                        }
+                        printf(total_bytes > 64 ? "...\n" : "\n");
+                    }
+
+                    fclose(f_w);
+                    printf("  [SAVE] Weight %zu bytes saved to %s\n", total_bytes, weight_filename);
+                } else {
+                    printf("  [ERROR] Failed to open %s. Make sure 'weights' folder exists.\n", weight_filename);
+                }
+
+                ggml_compute_forward_mul_mat_npu(params, dst);
+                
+                // 打印 NPU 计算结果的前 64 个 float 值
+                printf("\n[MATMUL #%d] DEBUG INFO:\n", op_num);
+                printf("  dst_tensor_ptr: %p\n", (void*)dst);
+                printf("  dst_data_ptr:   %p\n", (void*)dst->data);
+                printf("  dst_shape:      [%ld, %ld, %ld, %ld]\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+                printf("  dst_type:       %d\n", dst->type);
+
+                float* result = (float*)dst->data;
+                size_t total_elements = (size_t)dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+                // total_elements = total_elements < 2400 * 1536 ? 2400 * 1536 : total_elements;
+                size_t print_count = total_elements < 128 ? total_elements : 128;
+
+                // --- 2. 写入文件逻辑 ---
+                char filename[64];
+                snprintf(filename, sizeof(filename), "results/%d.txt", op_num);
+                FILE *f_out = fopen(filename, "w");
+
+                if (f_out) {
+                    for (size_t i = 0; i < total_elements; i++) {
+                        fprintf(f_out, "%a\n", result[i]); // 每个数字一行
+                    }
+                    fflush(f_out); // 1. 先把 C 库缓冲区推给 OS
+                    int fd = fileno(f_out); // 2. 获取底层文件描述符
+                    fsync(fd);     // 3. 强制操作系统将数据刷入磁盘介质
+                    fclose(f_out); // 4. 最后关闭
+                    printf("  [SAVE] All %zu elements saved to %s\n", total_elements, filename);
+                } else {
+                    printf("  [ERROR] Failed to open file %s for writing\n", filename);
+                }
+
+                // --- 3. 原有的控制台打印逻辑 ---
+                printf("  Output (dst, first %zu floats):\n", print_count);
+                for (size_t i = 0; i < print_count; i++) {
+                    if (i % 8 == 0) {
+                        printf("  [%p] : ", (void*)(result + i));
+                    }
+                    printf("%9.6f ", result[i]);
+                    if ((i + 1) % 8 == 0) {
+                        printf("\n");
+                    }
+                }
+                printf("--------------------------------------\n");
+                fflush(stdout);
+                return;
+
+                
+            } else {
+                // 其他线程：直接返回，不做任何事
+                return;
+            }
+        }else{
+            ggml_compute_forward_mul_mat_npu(params, dst);
+        }
+        ggml_barrier(params->threadpool);
+    }
+    // 如果不使用 NPU，所有线程继续执行 CPU 多线程代码
+    if (params->ith == 0) {
+        printf("ggml_compute_forward_mul_mat: [thread 0] Using CPU (multi-thread mode), nth=%d\n", params->nth);
+    }
+#endif
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
@@ -1423,6 +1753,263 @@ UseGgmlGemm2:;
         }
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+    }
+    
+    // CPU 计算完成后打印结果
+    if (ith == 0) {
+        int op_num = atomic_fetch_add(&g_matmul_counter, 1) + 1;
+        printf("\n[MATMUL #%d] Using CPU (completed)\n", op_num);
+        printf("  src0 (weight): %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src0->name, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3], src0->type);
+        printf("  src1 (input):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src1->name, (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3], src1->type);
+        printf("  dst (output):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", dst->name, (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3], dst->type);
+        
+        struct ggml_tensor* cur = src0;
+        while (cur != NULL) {
+            // 1. 打印基础信息和 Op 名称
+            // 使用 ggml_op_name() 将枚举转为可读字符串
+            printf("\n[DEBUG] Tensor: %-20s | Op: %-12s | Type: %d | Data: %p\n", 
+                cur->name, ggml_op_name(cur->op), cur->type, cur->data);
+
+            // 2. 打印维度和步长 (对排查 view/permute 导致的地址偏移极其重要)
+            printf("  Shape: [%ld, %ld, %ld, %ld] | Strides: [%zu, %zu, %zu, %zu]\n",
+                cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                cur->nb[0], cur->nb[1], cur->nb[2], cur->nb[3]);
+
+            // 3. 打印前 32 个元素 (针对 FP32)
+            if (cur->data != NULL) {
+                if (cur->type == GGML_TYPE_F32) {
+                    float * data_ptr = (float *)cur->data;
+                    printf("  Data (F32): ");
+                    int n_print = (int)ggml_nelements(cur) < 32 ? (int)ggml_nelements(cur) : 32;
+                    for (int i = 0; i < n_print; ++i) {
+                        printf("%.4f ", data_ptr[i]);
+                    }
+                    printf("\n");
+                } else {
+                    // 如果是量化类型，打印前几个字节的十六进制，确认是否全 0
+                    uint8_t * u8_ptr = (uint8_t *)cur->data;
+                    printf("  Data (Hex): ");
+                    for (int i = 0; i < 16; i++) printf("%02x ", u8_ptr[i]);
+                    printf("...\n");
+                }
+            } else {
+                printf("  Data: [NULL - Not yet allocated]\n");
+            }
+
+            // 4. 沿链条向上追溯 (增加路径说明)
+            if (cur->view_src != NULL) {
+                printf("  [VIEW] -> offset: %zu bytes | src: %s\n", cur->view_offs, cur->view_src->name);
+                cur = cur->view_src;
+            } else if (cur->src[0] != NULL) {
+                printf("  [OP]   -> input[0]: %s\n", cur->src[0]->name);
+                cur = cur->src[0];
+            } else {
+                printf("  [ROOT] -> Reached original weight.\n");
+                break;
+            }
+        }
+        printf("//////////////////////////////////////////////////////////\n");
+        
+        cur = src1;
+        while (cur != NULL) {
+            // 1. 打印基础信息和 Op 名称
+            // 使用 ggml_op_name() 将枚举转为可读字符串
+            printf("\n[DEBUG] Tensor: %-20s | Op: %-12s | Type: %d | Data: %p\n", 
+                cur->name, ggml_op_name(cur->op), cur->type, cur->data);
+
+            // 2. 打印维度和步长 (对排查 view/permute 导致的地址偏移极其重要)
+            printf("  Shape: [%ld, %ld, %ld, %ld] | Strides: [%zu, %zu, %zu, %zu]\n",
+                cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                cur->nb[0], cur->nb[1], cur->nb[2], cur->nb[3]);
+
+            // 3. 打印前 32 个元素 (针对 FP32)
+            if (cur->data != NULL) {
+                if (cur->type == GGML_TYPE_F32) {
+                    float * data_ptr = (float *)cur->data;
+                    printf("  Data (F32): ");
+                    int n_print = (int)ggml_nelements(cur) < 32 ? (int)ggml_nelements(cur) : 32;
+                    for (int i = 0; i < n_print; ++i) {
+                        printf("%.4f ", data_ptr[i]);
+                    }
+                    printf("\n");
+                } else {
+                    // 如果是量化类型，打印前几个字节的十六进制，确认是否全 0
+                    uint8_t * u8_ptr = (uint8_t *)cur->data;
+                    printf("  Data (Hex): ");
+                    for (int i = 0; i < 16; i++) printf("%02x ", u8_ptr[i]);
+                    printf("...\n");
+                }
+            } else {
+                printf("  Data: [NULL - Not yet allocated]\n");
+            }
+
+            // 4. 沿链条向上追溯 (增加路径说明)
+            if (cur->view_src != NULL) {
+                printf("  [VIEW] -> offset: %zu bytes | src: %s\n", cur->view_offs, cur->view_src->name);
+                cur = cur->view_src;
+            } else if (cur->src[0] != NULL) {
+                printf("  [OP]   -> input[0]: %s\n", cur->src[0]->name);
+                cur = cur->src[0];
+            } else {
+                printf("  [ROOT] -> Reached original weight.\n");
+                break;
+            }
+        }
+        
+        
+        
+        // 打印 src1 (input) 的前 64 个值 (FP32)
+        printf("[MATMUL #%d] Input (src1, first 64 floats):\n  ", op_num);
+        float* input_data = (float*)src1->data;
+        size_t input_elements = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
+        size_t input_print_count = input_elements < 64 ? input_elements : 64;
+        for (size_t i = 0; i < input_print_count; i++) {
+            printf("%.6f ", input_data[i]);
+            if ((i + 1) % 8 == 0) printf("\n  ");
+        }
+        printf("\n");
+        
+        // 打印 src0 (weight) 的前 64 个值 (可能是量化格式，只打印原始字节)
+        printf("[MATMUL #%d] Weight (src0, first 64 bytes, type=%d):\n  ", op_num, src0->type);
+
+        void* data_ptr = src0->data;
+        size_t total_bytes = ggml_nbytes(src0);
+
+        if (src0->type == GGML_TYPE_F32) {
+            // 处理 FP32 情况
+            float* f32_ptr = (float*)data_ptr;
+            size_t count = (total_bytes / sizeof(float)) < 16 ? (total_bytes / sizeof(float)) : 16;
+            for (size_t i = 0; i < count; i++) {
+                printf("%.4f ", f32_ptr[i]);
+                if ((i + 1) % 4 == 0) printf("\n  ");
+            }
+        } 
+        else if (src0->type == GGML_TYPE_F16) {
+            // 处理 FP16 情况 (注意：C++ 需包含 ggml_fp16_to_fp32 进行转换打印)
+            ggml_fp16_t* f16_ptr = (ggml_fp16_t*)data_ptr;
+            size_t count = (total_bytes / sizeof(ggml_fp16_t)) < 16 ? (total_bytes / sizeof(ggml_fp16_t)) : 16;
+            for (size_t i = 0; i < count; i++) {
+                printf("%.4f ", ggml_fp16_to_fp32(f16_ptr[i]));
+                if ((i + 1) % 4 == 0) printf("\n  ");
+            }
+        } 
+        else {
+            // 对于量化类型 (Q4_0, Q8_0 等)，直接打印十六进制是最稳妥的，因为它们是块结构
+            uint8_t* u8_ptr = (uint8_t*)data_ptr;
+            size_t weight_print_count = total_bytes < 64 ? total_bytes : 64;
+            for (size_t i = 0; i < weight_print_count; i++) {
+                printf("%02x ", u8_ptr[i]);
+                if ((i + 1) % 16 == 0) printf("\n  ");
+            }
+        }
+        printf("\n");
+        
+        // 2. 构造文件名
+        char filename[128];
+        snprintf(filename, sizeof(filename), "results/%d.txt", op_num);
+
+        // 3. 打开文件
+        FILE* fp = fopen(filename, "w");
+        if (fp) {
+            float* result = (float*)dst->data;
+            size_t total_elements = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+
+            // 写入文件：每行一个数字
+            for (size_t i = 0; i < total_elements; i++) {
+                fprintf(fp, "%a\n", result[i]);
+            }
+            fclose(fp);
+            
+            printf("[MATMUL #%d] Results saved to %s (Total elements: %zu)\n", 
+                    op_num, filename, total_elements);
+        } else {
+            fprintf(stderr, "[MATMUL #%d] Error: Could not open file %s for writing\n", 
+                    op_num, filename);
+        }
+
+        char in_filename[64];
+        snprintf(in_filename, sizeof(in_filename), "inputs/%d.txt", op_num);
+        FILE *f_in = fopen(in_filename, "w");
+
+        if (f_in) {
+            size_t in_elements = ggml_nelements(src1);
+            if (src1->type == GGML_TYPE_F32) {
+                float* in_ptr = (float*)src1->data;
+                for (size_t i = 0; i < in_elements; i++) {
+                    fprintf(f_in, "%a\n", in_ptr[i]);
+                }
+            } 
+            else if (src1->type == GGML_TYPE_F16) {
+                const ggml_fp16_t* in_ptr = (const ggml_fp16_t*)src1->data;
+                for (size_t i = 0; i < in_elements; i++) {
+                    fprintf(f_in, "%a\n", ggml_fp16_to_fp32(in_ptr[i]));
+                }
+            } 
+            else {
+                fprintf(f_in, "Unsupported type: %s\n", ggml_type_name(src1->type));
+            }
+            fclose(f_in);
+            printf("  [SAVE] Input (src1) %zu elements saved to %s\n", in_elements, in_filename);
+        } else {
+            printf("  [ERROR] Failed to open %s. Make sure 'inputs' folder exists.\n", in_filename);
+        }
+
+        char weight_filename[64];
+        snprintf(weight_filename, sizeof(weight_filename), "weights/%d.txt", op_num);
+        FILE *f_w = fopen(weight_filename, "w");
+
+        if (f_w) {
+            printf("[CPU OP #%d] src0 Weight (type=%s, bytes=%zu)\n", 
+                op_num, ggml_type_name(src0->type), ggml_nbytes(src0));
+
+            size_t total_bytes = ggml_nbytes(src0);
+            uint8_t* data_ptr = (uint8_t*)src0->data;
+
+            if (src0->type == GGML_TYPE_F32) {
+                // F32 打印为浮点数
+                float* f32_ptr = (float*)data_ptr;
+                size_t n_elements = ggml_nelements(src0);
+                for (size_t i = 0; i < n_elements; i++) {
+                    fprintf(f_w, "%a\n", f32_ptr[i]);
+                }
+            } 
+            else if (src0->type == GGML_TYPE_F16) {
+                // F16 转换后打印为浮点数
+                const ggml_fp16_t* f16_ptr = (const ggml_fp16_t*)data_ptr;
+                size_t n_elements = ggml_nelements(src0);
+                for (size_t i = 0; i < n_elements; i++) {
+                    fprintf(f_w, "%a\n", ggml_fp16_to_fp32(f16_ptr[i]));
+                }
+            } 
+            else {
+                // 对于 Q8_0, Q4_0 等量化类型，直接打印原始十六进制字节
+                // 这样可以确保即使不了解 block 结构也能进行逐字节对比
+                for (size_t i = 0; i < total_bytes; i++) {
+                    fprintf(f_w, "%02x\n", data_ptr[i]);
+                    
+                    // 屏幕控制台只打印前 64 字节预览，避免刷屏
+                    if (i < 64) {
+                        printf("%02x ", data_ptr[i]);
+                        if ((i + 1) % 16 == 0) printf("\n  ");
+                    }
+                }
+                printf(total_bytes > 64 ? "...\n" : "\n");
+            }
+
+            fclose(f_w);
+            printf("  [SAVE] Weight %zu bytes saved to %s\n", total_bytes, weight_filename);
+        } else {
+            printf("  [ERROR] Failed to open %s. Make sure 'weights' folder exists.\n", weight_filename);
+        }
+        // 4. 保持原来的控制台预览打印（前 64 个）
+        printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
+        float* result_ptr = (float*)dst->data;
+        size_t print_count = (dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3]) < 64 ? (dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3]) : 64;
+        for (size_t i = 0; i < print_count; i++) {
+            printf("%.6f ", result_ptr[i]);
+            if ((i + 1) % 8 == 0) printf("\n  ");
+        }
+        printf("\n[MATMUL #%d] CPU completed\n\n", op_num);
     }
 }
 
@@ -2027,10 +2614,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_solve_tri(params, tensor);
             } break;
-        case GGML_OP_GATED_DELTA_NET:
-            {
-                ggml_compute_forward_gated_delta_net(params, tensor);
-            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2210,7 +2793,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
-        case GGML_OP_GATED_DELTA_NET:
             {
                 n_tasks = n_threads;
             } break;
@@ -2488,7 +3070,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
     if (prio != GGML_SCHED_PRIO_LOW) {
         // Tell Windows that this thread should not be throttled (needs its own CPU core).
-        // Newer Windows 11 versions aggressively park (offline) CPU cores and often place
+        // Newer Windows 11 versions aggresively park (offline) CPU cores and often place
         // all our threads onto the first 4 cores which results in terrible performance with
         // n_threads > 4
         #if _WIN32_WINNT >= 0x0602
@@ -2871,12 +3453,8 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t ne11 = node->src[1]->ne[1]; // H
                         const int64_t ne12 = node->src[1]->ne[2]; // Channels In
 
-                        GGML_ASSERT(node->src[0]->type == GGML_TYPE_F16 || node->src[0]->type == GGML_TYPE_F32);
-                        GGML_ASSERT(node->src[1]->type == GGML_TYPE_F32);
-
-                        cur += ggml_type_size(node->src[0]->type) * ne00 * ne01 * ne02 * ne03;
-                        cur += ggml_type_size(node->src[0]->type) * ne10 * ne11 * ne12;
-
+                        cur += sizeof(ggml_fp16_t)*ne00*ne01*ne02*ne03;
+                        cur += sizeof(ggml_fp16_t)*ne10*ne11*ne12;
                     } break;
                 case GGML_OP_TOP_K:
                     {
@@ -2884,20 +3462,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
-                        const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
-                        const int64_t DK = node->src[1]->ne[0];
-                        const int64_t DV = node->src[2]->ne[0];
+                        const int64_t ne10 = node->src[1]->ne[0]; // DK
+                        const int64_t ne20 = node->src[2]->ne[0]; // DV
 
-                        // Tiled flash attention scratch (tile sizes defined in common.h)
-                        // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
-                        size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
-
-                        // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
-                        size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
-
-                        cur += MAX(prefill, decode);
+                        cur = sizeof(float)*(1*ne10 + 2*ne20)*n_tasks; // 1x head size K + 2x head size V (per thread)
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
@@ -2919,11 +3487,6 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
-                    } break;
-                case GGML_OP_GATED_DELTA_NET:
-                    {
-                        const int64_t S_v = node->src[2]->ne[0];
-                        cur = S_v * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:
                     {
@@ -2959,29 +3522,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith);
 
     struct ggml_compute_params params = {
-        /*.ith        =*/ state->ith,
-        /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
-        /*.wsize      =*/ cplan->work_size,
-        /*.wdata      =*/ cplan->work_data,
-        /*.threadpool =*/ tp,
-        /*.use_ref    =*/ cplan->use_ref,
+        /*.ith       =*/ state->ith,
+        /*.nth       =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
+        /*.wsize     =*/ cplan->work_size,
+        /*.wdata     =*/ cplan->work_data,
+        /*.threadpool=*/ tp,
     };
 
-#ifdef GGML_USE_OPENMP
-    GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
-#else
-    GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
-#endif
+    GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
-            continue;
-        }
-
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
 
@@ -2998,11 +3552,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
     }
 
-#ifdef GGML_USE_OPENMP
-    GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
-#else
-    GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
-#endif
+    GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
 
     ggml_barrier(state->threadpool);
 
@@ -3254,12 +3804,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
+        printf("aaaa\n");
         #pragma omp parallel num_threads(n_threads)
         {
             #pragma omp single
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
+                printf("bbb\n");
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 
@@ -3710,11 +4262,6 @@ void ggml_cpu_init(void) {
                 ggml_table_f32_f16[i] = f;
                 ggml_table_gelu_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(f));
                 ggml_table_gelu_quick_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(f));
-            }
-
-            // initialize E8M0 half table (256 entries)
-            for (int i = 0; i < (1 << 8); ++i) {
-                ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
