@@ -1137,38 +1137,6 @@ static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id
 
 
 
-// 根据 DMA 地址在当前 Domain 中反查 CPU 虚拟地址
-static void* find_va_by_dma(Domain* domain, uint64_t dma_addr) {
-    if (!domain) return nullptr;
-
-    // 1. 检查是否在 Input 缓冲区 (LeftMemory)
-    if (domain->input && dma_addr >= domain->input->iommu_addr && 
-        dma_addr < domain->input->iommu_addr + domain->input->size) {
-        return (uint8_t*)domain->input->virtual_addr + (dma_addr - domain->input->iommu_addr);
-    }
-
-    // 2. 检查是否在 Output 缓冲区 (LeftMemory)
-    if (domain->output && dma_addr >= domain->output->iommu_addr && 
-        dma_addr < domain->output->iommu_addr + domain->output->size) {
-        return (uint8_t*)domain->output->virtual_addr + (dma_addr - domain->output->iommu_addr);
-    }
-
-    // 3. 检查模型权重 (tensors map)
-    // 对应 Domain 里的：std::map<std::string, std::tuple<ggml_tensor*, TensorStorage*, IommuConfig*>> tensors;
-    for (auto const& [name, info] : domain->tensors) {
-        IommuConfig* cfg = std::get<2>(info);
-        if (cfg && dma_addr >= cfg->iommu_addr && dma_addr < cfg->iommu_addr + WEIGHT_SIZE) { // WEIGHT_SIZE 作为上限安全检查
-            // IommuConfig 本身不存 VA，但我们可以通过绑定的 ggml_tensor 获取
-            ggml_tensor* t = std::get<0>(info);
-            if (t && t->data) {
-                return (uint8_t*)t->data + (dma_addr - cfg->iommu_addr);
-            }
-        }
-    }
-
-    return nullptr;
-}
-
 // ============================================================================
 // Q8_0 Path: Parallel matmul with double buffering
 // ============================================================================
