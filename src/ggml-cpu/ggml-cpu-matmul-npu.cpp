@@ -2375,8 +2375,7 @@ static void compute_matmul_q8_0_parallel(
     //     }
     // }
     int index = 0;  // 用于交替访问 buffer_free[0] 和 buffer_free[1]
-    const ggml_fp16_t* weight_scales_ptr = (const ggml_fp16_t*)weight_scales.data();  // weight scales指针
-    
+
     for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
         {
             std::unique_lock<std::mutex> lock(cpu_worker_mtx);
@@ -2401,8 +2400,7 @@ static void compute_matmul_q8_0_parallel(
             // weight_scale_row[joff] = fp32(weight_scales_ptr[(j+joff)*scale_per_k + k/QK])
             float w_scale_cache[BLOCK_WEIGHT];
             for (int joff = 0; joff < current_m_task; joff++) {
-                w_scale_cache[joff] = ggml_fp16_to_fp32(
-                    weight_scales_ptr[(j + joff) * scale_per_k + k_scale_idx]);
+                w_scale_cache[joff] = weight_scales[(j + joff) * scale_per_k + k_scale_idx];
             }
 
             // 外层按 joff 步长4并行（参考第二段风格），内层遍历 N
@@ -2447,8 +2445,7 @@ static void compute_matmul_q8_0_parallel(
                     float32x4_t v_val  = vcvtq_f32_s32(v_int32);
 
                     // 乘以 combined_scale（目前不使用，留作备选）
-                    (void)combined;  // 消除未使用警告
-                    // v_val = vmulq_f32(v_val, combined);
+                    v_val = vmulq_f32(v_val, combined);
 
                     // 累加到 dst_data（注意：第一段原始用 double 累加，
                     // 这里改为 float 以支持 NEON；如需 double 精度请保留原始路径）
