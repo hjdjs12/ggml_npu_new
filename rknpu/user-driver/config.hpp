@@ -459,6 +459,7 @@ inline void cleanup_global_domain0() {
 
 inline std::map<std::string,FileDomains*> file_mapping;
 inline std::map<std::string, TensorInfo> tensor_info;
+inline std::map<std::string, uint64_t> tensor_scale_offset_map;  // 记录每个 tensor scale在权重文件中的偏移位置（字节单位）
 
 // ============================================================================
 // Domain 查找辅助函数

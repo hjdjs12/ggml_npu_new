@@ -1819,6 +1819,15 @@ void quantize_row_q6_K_ref(const float * GGML_RESTRICT x, block_q6_K * GGML_REST
     }
 }
 
+
+void quantize_row_q8_0_512_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t k) {
+}
+
+void dequantize_row_q8_0_512(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+
+}
+
+
 void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
