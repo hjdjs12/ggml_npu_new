@@ -73,7 +73,7 @@ constexpr int BLOCK_WEIGHT = 2048;
 constexpr int BLOCK_SHARED = 512;  // Match Q8_0 block size for exact dequantization (one scale per task)
 constexpr int BLOCK_WEIGHT_FP16 = 2048; // FP16 版本保持与 BLOCK_SHARED 一致，确保每个任务一个 scale
 constexpr int BLOCK_SHARED_FP16 = 512; // FP16 版本可以使用更大的共享块
-constexpr int BLOCK_N_FP16 = 348; // FP16 版本的 N 块大小
+constexpr int BLOCK_N_FP16 = 256; // FP16 版本的 N 块大小
 constexpr uint32_t BATCH_SIZE = 512;
 constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
 
