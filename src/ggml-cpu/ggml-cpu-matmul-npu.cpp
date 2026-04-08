@@ -68,7 +68,7 @@ struct cache_inval_range {
 
 // Cache prefetch constants
 constexpr int LOOKAHEAD = 12;
-constexpr int PER_TASK_CORE_NUM = 3;
+constexpr int PER_TASK_CORE_NUM = 1;
 constexpr int BLOCK_WEIGHT = 2048;
 constexpr int BLOCK_SHARED = 512;  // Match Q8_0 block size for exact dequantization (one scale per task)
 constexpr int BLOCK_WEIGHT_FP16 = 2048; // FP16 版本保持与 BLOCK_SHARED 一致，确保每个任务一个 scale
@@ -220,7 +220,7 @@ static std::shared_ptr<std::vector<int32_t*>> npu_tasks_shared;
 static std::shared_ptr<std::vector<float*>> npu_tasks_shared_fp16;
 
 // Double buffering control
-static int TASKS_LOCAL_PER_NUM = 3;
+static int TASKS_LOCAL_PER_NUM = 1;
 static std::atomic<int> buffer_free[2];
 static int npu_domain_id = 0;
 
@@ -1632,7 +1632,7 @@ static void compute_matmul_fp16_parallel_dynamic(
 
 
 
-    TASKS_LOCAL_PER_NUM = 2;
+    TASKS_LOCAL_PER_NUM = 1;
     const int M = src0->ne[1];  // weight rows (output dimension when transposed)
     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
     const int N = src1->ne[1];  // input rows (batch size)
