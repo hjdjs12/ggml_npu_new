@@ -852,6 +852,7 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
 
     uint64_t off = 0;  // 寄存器命令偏移量
     int task_num = 0;  // 实际任务数量
+    size_t per_task_output_stride = 0;  // 固定输出槽位跨度（按本批最大任务）
     
     // ===== 第1步：遍历所有任务，生成寄存器命令 =====
     for (int t = 0; t < PER_TASK_CORE_NUM && tasks.tasks[t].input_dma; t++) {
@@ -884,9 +885,13 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
         }
         
         // ✅ 设置输入/权重/输出的 DMA 地址（替代 RegCmd::setupAddr）
-        // NPU 输出是 NCHW4 布局，输出通道维度需要按 4 对齐
+        // NPU 输出是 NCHW4 布局，输出通道维度需要按 4 对齐。
+        // 注意：同一批次任务的 N 可能不同，必须使用固定槽位跨度避免地址重叠。
         size_t per_task_output_size = (size_t) m * align_up4(n);
-        uint64_t task_output_dma = output_dma + (t + output_index) * per_task_output_size * sizeof(int32_t);
+        if (per_task_output_size > per_task_output_stride) {
+            per_task_output_stride = per_task_output_size;
+        }
+        uint64_t task_output_dma = output_dma + (t + output_index) * per_task_output_stride * sizeof(int32_t);
         update_matmul_addr(reg_va, tsk.input_dma, tsk.weight_dma, task_output_dma);
         
         // ✅ 填充任务描述符（rknpu_task 结构）
@@ -947,11 +952,8 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
     std::cout << "[rknpu_matmul] NPU execution completed, time: " << (end_time - start_time) / 1000.0 << " ms" << std::endl;
     // ===== 第3步：返回 NPU 输出指针 =====
     for (int t = 0; t < task_num; t++) {
-        auto &tsk = tasks.tasks[t];
-        size_t per_task_output_size = (size_t) tsk.M * align_up4(tsk.N);
-        
-        // 计算输出指针：基地址 + 偏移
-        result.output[t] = output_va + (t + output_index) * per_task_output_size;
+        // 计算输出指针：基地址 + 固定槽位偏移
+        result.output[t] = output_va + (t + output_index) * per_task_output_stride;
         
         // 无效化输出缓冲区的 Cache，确保读取到 NPU 写入的最新数据
         // size_t buffer_size = per_task_output_size * sizeof(int32_t);
@@ -999,6 +1001,7 @@ static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id
 
     uint64_t off = 0;  // 寄存器命令偏移量
     int task_num = 0;  // 实际任务数量
+    size_t per_task_output_stride = 0;  // 固定输出槽位跨度（按本批最大任务）
     
     // ===== 第1步：遍历所有任务，生成寄存器命令 =====
     for (int t = 0; t < PER_TASK_CORE_NUM && tasks.tasks[t].input_dma; t++) {
@@ -1031,9 +1034,12 @@ static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id
         }
         
         // ✅ 设置输入/权重/输出的 DMA 地址（替代 RegCmd::setupAddr）
-        // 计算每个任务的输出偏移：假设每个任务最多输出 m*n 个 fp16（占用 m*n*2 字节）
-        size_t per_task_output_size = (size_t) m * align_up4(n);  // 每个任务最大输出元素数
-        uint64_t task_output_dma = output_dma + (t + output_index) * per_task_output_size * sizeof(float);
+        // 同一批次任务的 N 可能不同，必须使用固定槽位跨度避免地址重叠。
+        size_t per_task_output_size = (size_t) m * align_up4(n);  // 每个任务输出元素数
+        if (per_task_output_size > per_task_output_stride) {
+            per_task_output_stride = per_task_output_size;
+        }
+        uint64_t task_output_dma = output_dma + (t + output_index) * per_task_output_stride * sizeof(float);
         update_matmul_addr(reg_va, tsk.input_dma, tsk.weight_dma, task_output_dma);
         
         // ✅ 填充任务描述符（rknpu_task 结构）
@@ -1068,7 +1074,7 @@ static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id
         .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,  // 任务标志
         .timeout = 6000,          // 超时时间（毫秒）
         .task_start = 0,
-        .task_number = task_num,  // ✅ 修复：使用实际任务数
+        .task_number = 1,  // ✅ 修复：使用实际任务数
         .task_counter = 0,
         .priority = 0,
         .task_obj_addr = tasks_obj,  // 任务描述符对象句柄
@@ -1093,11 +1099,8 @@ static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id
     
     // ===== 第3步：返回 NPU 输出指针 =====
     for (int t = 0; t < task_num; t++) {
-        auto &tsk = tasks.tasks[t];
-        size_t per_task_output_size = (size_t) tsk.M * align_up4(tsk.N);  // 每个任务输出元素数
-        
-        // 计算输出指针：基地址 + 偏移
-        result.output_fp16[t] = output_va + (t + output_index) * per_task_output_size;
+        // 计算输出指针：基地址 + 固定槽位偏移
+        result.output_fp16[t] = output_va + (t + output_index) * per_task_output_stride;
         
         // 无效化输出缓冲区的 Cache，确保读取到 NPU 写入的最新数据
         // size_t buffer_size = per_task_output_size * sizeof(int32_t);
@@ -1119,109 +1122,109 @@ static void compute_matmul_fp16_parallel(
     int domain_id) {
     
 
-    const int M = 1536;  // weight rows (output dimension when transposed)
-    const int K = 4096;  // weight cols = input cols (shared dimension)
-    const int N = 512;  // input rows (batch size)
-    size_t src0_size = M * K * sizeof(ggml_fp16_t);
-    std::vector<ggml_fp16_t> weight_f16(M * K);
+    // const int M = 1536;  // weight rows (output dimension when transposed)
+    // const int K = 4096;  // weight cols = input cols (shared dimension)
+    // const int N = 512;  // input rows (batch size)
+    // size_t src0_size = M * K * sizeof(ggml_fp16_t);
+    // std::vector<ggml_fp16_t> weight_f16(M * K);
 
-    FILE *f_w = fopen("/mnt/nvme/stable-diffusion-new2.cpp/weights/442.txt", "rb");
-    if (f_w) {
-        fread(weight_f16.data(), 1, src0_size, f_w);
-        fclose(f_w);
-        printf(">>> Loaded weight: %zu bytes\n", src0_size);
-    } else {
-        printf(">>> Error: Could not open teacache_weight.bin\n");
-    }
-
-    // --- 2. 加载 Input (src1) ---
-    // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
-    size_t tmp_size = N * K * sizeof(float);  // 如果需要临时存储 FP32 版本
-    std::vector<ggml_fp16_t> input_fp16(N * K);
-    std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
-    FILE *f_i = fopen("/mnt/nvme/stable-diffusion-new2.cpp/inputs/442.txt", "rb");
-    if (f_i) {
-        fread(input_fp32.data(), 1, tmp_size, f_i);
-        fclose(f_i);
-        printf(">>> Loaded input: %zu bytes\n", tmp_size);
-    } else {
-        printf(">>> Error: Could not open teacache_input.bin\n");
-    }
-    // if(src1->type == GGML_TYPE_F16){
-    //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
-    // }else{
-    ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
+    // FILE *f_w = fopen("/mnt/nvme/stable-diffusion-new2.cpp/weights/442.txt", "rb");
+    // if (f_w) {
+    //     fread(weight_f16.data(), 1, src0_size, f_w);
+    //     fclose(f_w);
+    //     printf(">>> Loaded weight: %zu bytes\n", src0_size);
+    // } else {
+    //     printf(">>> Error: Could not open teacache_weight.bin\n");
     // }
-    // --- 1. 打印 Weight (src0) 前 10 个元素 ---
-    if (!weight_f16.empty()) {
-        printf(">>> Weight (src0) first 10 elements:\n  ");
-        for (int i = 0; i < 10 && i < (M * K); i++) {
-            // 转换并打印
-            float val = ggml_fp16_to_fp32(weight_f16[i]);
-            printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
-            if ((i + 1) % 5 == 0) printf("\n  ");
-        }
-        printf("\n");
-    }
 
-    // --- 2. 打印 Input (src1) 前 10 个元素 ---
-    if (!input_fp16.empty()) {
-        printf(">>> Input (src1) first 10 elements:\n  ");
-        for (int i = 0; i < 10 && i < (N * K); i++) {
-            // 转换并打印
-            float val = ggml_fp16_to_fp32(input_fp16[i]);
-            printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
-            if ((i + 1) % 5 == 0) printf("\n  ");
-        }
-        printf("\n");
-    }
+    // // --- 2. 加载 Input (src1) ---
+    // // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
+    // size_t tmp_size = N * K * sizeof(float);  // 如果需要临时存储 FP32 版本
+    // std::vector<ggml_fp16_t> input_fp16(N * K);
+    // std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
+    // FILE *f_i = fopen("/mnt/nvme/stable-diffusion-new2.cpp/inputs/442.txt", "rb");
+    // if (f_i) {
+    //     fread(input_fp32.data(), 1, tmp_size, f_i);
+    //     fclose(f_i);
+    //     printf(">>> Loaded input: %zu bytes\n", tmp_size);
+    // } else {
+    //     printf(">>> Error: Could not open teacache_input.bin\n");
+    // }
+    // // if(src1->type == GGML_TYPE_F16){
+    // //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    // // }else{
+    // ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
+    // // }
+    // // --- 1. 打印 Weight (src0) 前 10 个元素 ---
+    // if (!weight_f16.empty()) {
+    //     printf(">>> Weight (src0) first 10 elements:\n  ");
+    //     for (int i = 0; i < 10 && i < (M * K); i++) {
+    //         // 转换并打印
+    //         float val = ggml_fp16_to_fp32(weight_f16[i]);
+    //         printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
+    //         if ((i + 1) % 5 == 0) printf("\n  ");
+    //     }
+    //     printf("\n");
+    // }
+
+    // // --- 2. 打印 Input (src1) 前 10 个元素 ---
+    // if (!input_fp16.empty()) {
+    //     printf(">>> Input (src1) first 10 elements:\n  ");
+    //     for (int i = 0; i < 10 && i < (N * K); i++) {
+    //         // 转换并打印
+    //         float val = ggml_fp16_to_fp32(input_fp16[i]);
+    //         printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
+    //         if ((i + 1) % 5 == 0) printf("\n  ");
+    //     }
+    //     printf("\n");
+    // }
     // GGML dimensions (physical storage)
 
-    // const int M = src0->ne[1];  // weight rows (output dimension when transposed)
-    // const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
-    // const int N = src1->ne[1];  // input rows (batch size)
-    // const int QK = 512;
+    const int M = src0->ne[1];  // weight rows (output dimension when transposed)
+    const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
+    const int N = src1->ne[1];  // input rows (batch size)
+    const int QK = 512;
     
     
 
-    // std::vector<ggml_fp16_t> input_fp16(N * K, 0);
-    // if(src1->type == GGML_TYPE_F16){
-    //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
-    // }else{
-    //     ggml_cpu_fp32_to_fp16((const float*)src1->data, input_fp16.data(), N * K);
-    // }
+    std::vector<ggml_fp16_t> input_fp16(N * K, 0);
+    if(src1->type == GGML_TYPE_F16){
+        memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    }else{
+        ggml_cpu_fp32_to_fp16((const float*)src1->data, input_fp16.data(), N * K);
+    }
 
     
-    // std::vector<ggml_fp16_t> weight_f16(M * K, 0);
+    std::vector<ggml_fp16_t> weight_f16(M * K, 0);
 
-    // if (src0->type == GGML_TYPE_F16) {
-    //     // 如果本来就是 FP16，直接拷贝
-    //     memcpy(weight_f16.data(), src0->data, M * K * sizeof(ggml_fp16_t));
-    // }
-    // else if (src0->type == GGML_TYPE_BF16) {
-    //     fprintf(stderr, "[NPU] Converting Weight: BF16 -> FP16\n");
-    //     const uint16_t * bf16_ptr = (const uint16_t *)src0->data;
+    if (src0->type == GGML_TYPE_F16) {
+        // 如果本来就是 FP16，直接拷贝
+        memcpy(weight_f16.data(), src0->data, M * K * sizeof(ggml_fp16_t));
+    }
+    else if (src0->type == GGML_TYPE_BF16) {
+        fprintf(stderr, "[NPU] Converting Weight: BF16 -> FP16\n");
+        const uint16_t * bf16_ptr = (const uint16_t *)src0->data;
 
-    //     for (int i = 0; i < M * K; ++i) {
-    //         // 1. BF16 转 FP32
-    //         // BF16 的比特位就是 FP32 的高 16 位
-    //         uint32_t f32_bits = (uint32_t)bf16_ptr[i] << 16;
-    //         float f32;
-    //         memcpy(&f32, &f32_bits, sizeof(float));
+        for (int i = 0; i < M * K; ++i) {
+            // 1. BF16 转 FP32
+            // BF16 的比特位就是 FP32 的高 16 位
+            uint32_t f32_bits = (uint32_t)bf16_ptr[i] << 16;
+            float f32;
+            memcpy(&f32, &f32_bits, sizeof(float));
 
-    //         // 2. FP32 转 FP16 (交给 NPU)
-    //         weight_f16[i] = ggml_fp32_to_fp16(f32);
-    //     }
-    // }
-    // else if (src0->type == GGML_TYPE_F32) {
-    //     // 如果是 FP32，转换为 FP16
-    //     fprintf(stderr, "[NPU] Converting Weight: FP32 -> FP16\n");
-    //     ggml_cpu_fp32_to_fp16((const float*)src0->data, weight_f16.data(), M * K);
-    // }
-    // else {
-    //     fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to FP16, got type %d\n", src0->type);
-    //     throw std::runtime_error("Weight tensor not pre-quantized");
-    // }
+            // 2. FP32 转 FP16 (交给 NPU)
+            weight_f16[i] = ggml_fp32_to_fp16(f32);
+        }
+    }
+    else if (src0->type == GGML_TYPE_F32) {
+        // 如果是 FP32，转换为 FP16
+        fprintf(stderr, "[NPU] Converting Weight: FP32 -> FP16\n");
+        ggml_cpu_fp32_to_fp16((const float*)src0->data, weight_f16.data(), M * K);
+    }
+    else {
+        fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to FP16, got type %d\n", src0->type);
+        throw std::runtime_error("Weight tensor not pre-quantized");
+    }
     
     auto convert_s_time = ggml_time_us();
     // Step 3: Convert to NPU layout
@@ -1469,8 +1472,8 @@ static void compute_matmul_fp16_parallel(
             float* task_output = npu_tasks_shared_fp16->at(t + toff);
 
             int current_m_task = std::min(M - j, BLOCK_WEIGHT_FP16);
-            invalid_cache(task_output, (uint64_t) N * align_up4(current_m_task) * sizeof(float));
             int current_n_task = std::min(N - i, BLOCK_N_FP16);
+            invalid_cache(task_output, (uint64_t) current_n_task * align_up4(current_m_task) * sizeof(float));
 
             // ---------------------------------------------------------------
             // 外层按 joff 步长4并行，对齐 int8 风格
@@ -1539,7 +1542,7 @@ static void compute_matmul_fp16_parallel(
     npu_tasks_shared_fp16.reset();
 }
 
-
+static std::mutex print_mtx;
 
 static void compute_matmul_fp16_parallel_dynamic(
     const struct ggml_tensor* src0,  // weight (M x K, Q8_0, pre-quantized with IOMMU)
@@ -1547,6 +1550,89 @@ static void compute_matmul_fp16_parallel_dynamic(
     struct ggml_tensor* dst,         // output (N x M, FP32)
     int domain_id) {
     
+
+    // const int M = 1536;  // weight rows (output dimension when transposed)
+    // const int K = 1536;  // weight cols = input cols (shared dimension)
+    // const int N = 512;  // input rows (batch size)
+    // TASKS_LOCAL_PER_NUM = 2; // debug: force single-task submit to isolate core2/slot2 issues
+    // std::vector<ggml_fp16_t> weight_f16(M * K);
+
+    // // 从 .txt 按行读取，每行一个元素（支持 %a 十六进制浮点）
+    // {
+    //     std::ifstream f_w("/mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt");
+    //     if (!f_w.is_open()) {
+    //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt\n");
+    //     } else {
+    //         std::string line;
+    //         size_t count = 0;
+    //         while (count < (size_t) M * K && std::getline(f_w, line)) {
+    //             char * end = nullptr;
+    //             float v = std::strtof(line.c_str(), &end);
+    //             if (end == line.c_str()) {
+    //                 continue;
+    //             }
+    //             weight_f16[count++] = ggml_fp32_to_fp16(v);
+    //         }
+    //         printf(">>> Loaded weight: %zu / %d elements\n", count, M * K);
+    //     }
+    // }
+
+    // // --- 2. 加载 Input (src1) ---
+    // // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
+    // std::vector<ggml_fp16_t> input_fp16(N * K);
+    // std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
+
+    // {
+    //     std::ifstream f_i("/mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt");
+    //     if (!f_i.is_open()) {
+    //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt\n");
+    //     } else {
+    //         std::string line;
+    //         size_t count = 0;
+    //         while (count < (size_t) N * K && std::getline(f_i, line)) {
+    //             char * end = nullptr;
+    //             float v = std::strtof(line.c_str(), &end);
+    //             if (end == line.c_str()) {
+    //                 continue;
+    //             }
+    //             input_fp32[count++] = v;
+    //         }
+    //         printf(">>> Loaded input: %zu / %d elements\n", count, N * K);
+    //     }
+    // }
+    // // if(src1->type == GGML_TYPE_F16){
+    // //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    // // }else{
+    // ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
+    // // }
+    // // --- 1. 打印 Weight (src0) 前 10 个元素 ---
+    // if (!weight_f16.empty()) {
+    //     printf(">>> Weight (src0) first 10 elements:\n  ");
+    //     for (int i = 0; i < 10 && i < (M * K); i++) {
+    //         // 转换并打印
+    //         float val = ggml_fp16_to_fp32(weight_f16[i]);
+    //         printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
+    //         if ((i + 1) % 5 == 0) printf("\n  ");
+    //     }
+    //     printf("\n");
+    // }
+
+    // // --- 2. 打印 Input (src1) 前 10 个元素 ---
+    // if (!input_fp16.empty()) {
+    //     printf(">>> Input (src1) first 10 elements:\n  ");
+    //     for (int i = 0; i < 10 && i < (N * K); i++) {
+    //         // 转换并打印
+    //         float val = ggml_fp16_to_fp32(input_fp16[i]);
+    //         printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
+    //         if ((i + 1) % 5 == 0) printf("\n  ");
+    //     }
+    //     printf("\n");
+    // }
+
+
+
+
+    TASKS_LOCAL_PER_NUM = 2;
     const int M = src0->ne[1];  // weight rows (output dimension when transposed)
     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
     const int N = src1->ne[1];  // input rows (batch size)
@@ -1674,8 +1760,14 @@ static void compute_matmul_fp16_parallel_dynamic(
             input_dma_base = cur_input_start;
         }
         weight_dma_base = cur_weight_start;
-        input_dma_base += _n_i * K_in * sizeof(ggml_fp16_t);
+        input_dma_base += _n_i * K * sizeof(ggml_fp16_t);
     }
+
+    for (int t = 0; t < (int)tasks->size(); t++) {
+        matmul_task_t task = std::get<2>(tasks->at(t));
+        std::cout << "Task " << t << ": (" << std::get<0>(tasks->at(t)) << ", " << std::get<1>(tasks->at(t)) << ")" << std::endl;
+    }
+
     // Step 7: Initialize output to zero
     std::fill((float*)dst->data, (float*)dst->data + N * M, 0.0f);
     
@@ -1723,22 +1815,22 @@ static void compute_matmul_fp16_parallel_dynamic(
                 // }else{
                 //     next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM, std::memory_order_relaxed);
                 // }
-                if(t + toff != next_task_idx.load(std::memory_order_relaxed) && flag){
-                    continue;
-                }
-                if (flag) {
-                    next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM - toff, std::memory_order_relaxed);
-                    flag = false;
-                }
-                std::cout << "npu processing task :" << t + toff << std::endl;
+                // if(t + toff != next_task_idx.load(std::memory_order_relaxed) && flag){
+                //     continue;
+                // }
+                // if (flag) {
+                //     next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM - toff, std::memory_order_relaxed);
+                //     flag = false;
+                // }
+                // std::cout << "npu processing task :" << t + toff << std::endl;
 
                 const auto [j, k, task] = tasks->at(t + toff);
                 auto i = task.I;
                 float* task_output = npu_tasks_shared_fp16->at(t + toff);
 
                 int current_m_task = std::min(M - j, BLOCK_WEIGHT_FP16);
-                invalid_cache(task_output, (uint64_t) N * align_up4(current_m_task) * sizeof(float));
                 int current_n_task = std::min(N - i, BLOCK_N_FP16);
+                invalid_cache(task_output, (uint64_t) current_n_task * align_up4(current_m_task) * sizeof(float));
 
                 // ---------------------------------------------------------------
                 // 外层按 joff 步长4并行，对齐 int8 风格
@@ -1771,18 +1863,38 @@ static void compute_matmul_fp16_parallel_dynamic(
                             // 满4通道路径：纯 NEON，无分支
                             // task_output 已是 float（fp32），直接 vld1q_f32 加载
                             // --------------------------------------------------
+                            // // 调试输出：打印每个通道的 offset_in_result 和 value
+                            // for (int lane = 0; lane < 4; lane++) {
+                            //     int cur_offset_in_result = (ioff + i) * M + cur_M_base + lane;
+                            //     float value = task_output[feature_offset + lane];
+                            //     int cur_i = ioff + i;
+                            //     int cur_M = cur_M_base + lane;
+                            //     {
+                            //         std::lock_guard<std::mutex> lock(print_mtx); // 锁住直到花括号结束
+                            //         std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:" << task_output[feature_offset + lane] << "    cur_i:" << cur_i <<"     i:"<< i << "    ioff:" << ioff << "    cur_M:" << cur_M << std::endl;
+                            //     }
+                            // }
                             float32x4_t v_val = vld1q_f32(&task_output[feature_offset]);
 
                             float* out_ptr = &dst_data[(ioff + i) * M + cur_M_base];
                             float32x4_t out_old = vld1q_f32(out_ptr);
                             out_old = vaddq_f32(out_old, v_val);
                             vst1q_f32(out_ptr, out_old);
+                            
+
                         } else {
                             // --------------------------------------------------
                             // 边界路径：剩余 lanes < 4，逐元素处理
                             // --------------------------------------------------
                             for (int lane = 0; lane < lanes; lane++) {
                                 float output = task_output[feature_offset + lane];
+                                int cur_offset_in_result = (ioff + i) * M + cur_M_base + lane;
+                                int cur_i = ioff + i;
+                                int cur_M = cur_M_base + lane;
+                                // {
+                                //     std::lock_guard<std::mutex> lock(print_mtx); // 锁住直到花括号结束
+                                //     std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:" << task_output[feature_offset + lane] << "    cur_i:" << cur_i <<"     i:"<< i << "    ioff:" << ioff << "    cur_M:" << cur_M << std::endl;
+                                // }
                                 dst_data[(ioff + i) * M + cur_M_base + lane] += output;
                             }
                         }
@@ -2994,10 +3106,11 @@ void ggml_compute_forward_mul_mat_npu(
         }else{
             std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
             input_type.store(0, std::memory_order_release);
-            compute_matmul_fp16_parallel(src0, src1, dst, domain_id);
-            // compute_matmul_fp16_parallel_dynamic(src0, src1, dst, domain_id);
+            // compute_matmul_fp16_parallel(src0, src1, dst, domain_id);
+            compute_matmul_fp16_parallel_dynamic(src0, src1, dst, domain_id);
         }
-
+        // std::cout << "Processing..." << std::flush;         // 不换行仅刷新
+        // std::exit(0);
     } catch (const std::exception& e) {
         fprintf(stderr, "[NPU] Error: %s, falling back to CPU\n", e.what());
         // Let GGML handle CPU fallback by not writing to dst
