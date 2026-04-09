@@ -1871,19 +1871,20 @@ static void compute_matmul_fp16_parallel_dynamic(
             auto s_time = ggml_time_us();
             bool flag = true;
             for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
-                // if(bitmap[i].load(std::memory_order_relaxed) == 1){
-                //     continue;
-                // }else{
-                //     next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM, std::memory_order_relaxed);
-                // }
-                // if(t + toff != next_task_idx.load(std::memory_order_relaxed) && flag){
-                //     continue;
-                // }
-                // if (flag) {
-                //     next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM - toff, std::memory_order_relaxed);
-                //     flag = false;
-                // }
-                // std::cout << "npu processing task :" << t + toff << std::endl;
+                
+                if(bitmap[t + toff].load(std::memory_order_relaxed) == 1){
+                    continue;
+                }else{
+                    next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM, std::memory_order_relaxed);
+                }
+                if(t + toff != next_task_idx.load(std::memory_order_relaxed) && flag){
+                    continue;
+                }
+                if (flag) {
+                    next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM - toff, std::memory_order_relaxed);
+                    flag = false;
+                }
+                std::cout << "npu processing task :" << t + toff << std::endl;
 
                 const auto [j, k, task] = tasks->at(t + toff);
                 auto i = task.I;
@@ -2165,21 +2166,21 @@ static void compute_matmul_fp16_parallel_dynamic(
 
     std::vector<float> cpu_local_dst(N * M, 0.0f);
     std::thread t_npu(npu_worker);
-    // std::thread t_cpu([&]() { cpu_worker(cpu_local_dst); });
+    std::thread t_cpu([&]() { cpu_worker(cpu_local_dst); });
 
     t_npu.join();
-    // t_cpu.join();
+    t_cpu.join();
     auto thread_end_time = ggml_time_us();
     std::cout << "Total thread execution time: " << (thread_end_time - submit_time) / 1000.0 << " ms" << std::endl;
 
     int total = N * M;
     int idx = 0;
 
-    // for (; idx + 4 <= total; idx += 4) {
-    //     float32x4_t g = vld1q_f32(&dst_data[idx]);
-    //     float32x4_t l = vld1q_f32(&cpu_local_dst[idx]);
-    //     vst1q_f32(&dst_data[idx], vaddq_f32(g, l));
-    // }
+    for (; idx + 4 <= total; idx += 4) {
+        float32x4_t g = vld1q_f32(&dst_data[idx]);
+        float32x4_t l = vld1q_f32(&cpu_local_dst[idx]);
+        vst1q_f32(&dst_data[idx], vaddq_f32(g, l));
+    }
     auto final_merge_time = ggml_time_us();
     std::cout << "Final merge time: " << (final_merge_time - thread_end_time) / 1000.0 << " ms" << std::endl;
     std::cout << "Total NPU wait time: " << npu_wait_time / 1000.0 << " ms" << std::endl;
