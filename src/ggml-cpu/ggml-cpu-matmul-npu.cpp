@@ -73,7 +73,7 @@ constexpr int BLOCK_WEIGHT = 2048;
 constexpr int BLOCK_SHARED = 512;  // Match Q8_0 block size for exact dequantization (one scale per task)
 constexpr int BLOCK_WEIGHT_FP16 = 2048; // FP16 版本保持与 BLOCK_SHARED 一致，确保每个任务一个 scale
 constexpr int BLOCK_SHARED_FP16 = 512; // FP16 版本可以使用更大的共享块
-constexpr int BLOCK_N_FP16 = 256; // FP16 版本的 N 块大小
+int BLOCK_N_FP16 = 256; // FP16 版本的 N 块大小
 constexpr uint32_t BATCH_SIZE = 512;
 constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
 
@@ -1544,6 +1544,26 @@ static void compute_matmul_fp16_parallel(
 
 static std::mutex print_mtx;
 
+
+int get_optimized_n(int M) {
+    // 1. 确定起始搜索位置：不大于 348 且不大于 M
+    int start = std::min(348, M);
+    
+    // 2. 将 start 调整为最接近的、小于等于自己的 4 的倍数
+    // 比如 start 为 347，调整后为 344
+    start = (start / 4) * 4;
+
+    // 3. 向下步进搜索，步长为 4
+    for (int n = start; n > 0; n -= 4) {
+        if (M % n == 0) {
+            return n;
+        }
+    }
+
+    return 0; // 如果找不到符合条件的 4 的倍数约数
+}
+
+
 static void compute_matmul_fp16_parallel_dynamic(
     const struct ggml_tensor* src0,  // weight (M x K, Q8_0, pre-quantized with IOMMU)
     const struct ggml_tensor* src1,  // input (N x K, FP32)
@@ -1636,7 +1656,8 @@ static void compute_matmul_fp16_parallel_dynamic(
     const int M = src0->ne[1];  // weight rows (output dimension when transposed)
     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
     const int N = src1->ne[1];  // input rows (batch size)
-    std::cout << "result-size:" << N * M << std::endl;
+    BLOCK_N_FP16 = N > 348 ? get_optimized_n(N) : 348;
+    // std::cout << "result-size:" << N * M << std::endl;
     
     std::vector<ggml_fp16_t> input_fp16(N * K, 0);
     if(src1->type == GGML_TYPE_F16){
