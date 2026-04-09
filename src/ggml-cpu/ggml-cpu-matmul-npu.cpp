@@ -1851,9 +1851,10 @@ static void compute_matmul_fp16_parallel_dynamic(
 
     std::mutex dst_mtx; // 保护 dst 的累加操作
     std::atomic<int> next_task_idx{0};
+    
     auto total_tasks = tasks->size();
+    std::vector<std::atomic<bool>> task_taken(total_tasks);
 
-    std::vector<std::atomic<uint64_t>> bitmap(tasks->size());
     auto npu_worker = [&]() {
         for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
             {
@@ -1872,17 +1873,16 @@ static void compute_matmul_fp16_parallel_dynamic(
             bool flag = true;
             for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
                 
-                if(bitmap[t + toff].load(std::memory_order_relaxed) == 1){
+                // if(t + toff != next_task_idx.load(std::memory_order_relaxed) && flag){
+                //     continue;
+                // }
+                // if (flag) {
+                //     next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM - toff, std::memory_order_relaxed);
+                //     flag = false;
+                // }
+                bool expected = false;
+                if (!task_taken[t + toff].compare_exchange_strong(expected, true)){
                     continue;
-                }else{
-                    next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM, std::memory_order_relaxed);
-                }
-                if(t + toff != next_task_idx.load(std::memory_order_relaxed) && flag){
-                    continue;
-                }
-                if (flag) {
-                    next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM - toff, std::memory_order_relaxed);
-                    flag = false;
                 }
                 std::cout << "npu processing task :" << t + toff << std::endl;
 
@@ -1977,160 +1977,23 @@ static void compute_matmul_fp16_parallel_dynamic(
             index = (index + 1) & 0x1;
         }
     };
-    // auto npu_worker = [&]() {
-    //     while (true) {
-    //         auto s_time = ggml_time_us();
-    //         int t = next_task_idx.fetch_add(3, std::memory_order_relaxed);
-    //         if (t >= total_tasks) break;
-    //         auto local_tasks = std::make_shared<std::vector<std::tuple<int, int, matmul_task_t>>>();
-    //         for(int toff = 0; toff < 3 && t + toff < total_tasks; toff++) {
-    //             const auto& e = tasks->at(t + toff);
-    //             local_tasks->push_back(e);
-    //         }
-            
-    //         // 1. 提交到 NPU 硬件 (逻辑同前，此处略)
-    //         {
-    //             std::lock_guard<std::mutex> lock(npu_worker_mtx);
-    //             tasks_list.push_back(local_tasks);
-    //             npu_domain_id = domain_id;
-    //             npu_cv.notify_one();
-    //         }
-    //         // 2. 获取 NPU 结果 task_output (FP32)
-    //         {
-    //             std::unique_lock<std::mutex> lock(cpu_worker_mtx);
-    //             cpu_cv.wait(lock, [&] { 
-    //                 return npu_tasks_shared_fp16.use_count() != 0 &&
-    //                     npu_tasks_shared_fp16->at(0) != nullptr && 
-    //                     buffer_free[index].load(std::memory_order_acquire) == 1;
-    //             });
-    //             std::cout << "NPU worker got task output for tasks "  << std::endl;
- 
-    //         }
-    //         auto e_time = ggml_time_us();
-    //         npu_wait_time += (e_time - s_time);
-    //         // 3. 累加到 dst (必须加锁或使用 atomic，因为 CPU 可能也在算同一个 (i,j) 的不同 k)
-    //         {
-    //             for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < total_tasks; toff++) {
-    //                 const auto [j, k, task] = tasks->at(t + toff);
-    //                 auto i = task.I;
-    //                 float* task_output = npu_tasks_shared_fp16->at(toff);
-
-    //                 invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT_FP16) * sizeof(float));
-
-    //                 int current_m_task = std::min(M - j, BLOCK_WEIGHT_FP16);
-    //                 int current_n_task = std::min(N - i, BLOCK_N_FP16);
-
-    //                 // ---------------------------------------------------------------
-    //                 // 外层按 joff 步长4并行，对齐 int8 风格
-    //                 // NPU 输出布局: NCHW4，H=current_n_task，W_block=4
-    //                 // feature_data(current_n_task, 4, joff, ioff) 随 ioff 每次 +4
-    //                 // ---------------------------------------------------------------
-    //         #pragma omp parallel for num_threads(4)
-    //                 for (int joff = 0; joff < current_m_task; joff += 4) {
-    //                     const int cur_M_base = j + joff;
-    //                     const int lanes = std::min(4, current_m_task - joff);
-
-    //                     // 初始 feature_offset，ioff=0 时的偏移
-    //                     int feature_offset = feature_data(current_n_task, 4, joff, 0);
-
-    //                     for (int ioff = 0; ioff < current_n_task; ioff++) {
-    //                         // Prefetch 下一行 dst 写目标 和 NPU 输出
-    //                         if (ioff + LOOKAHEAD < current_n_task) {
-    //                             __builtin_prefetch(
-    //                                 &dst_data[(ioff + i + LOOKAHEAD) * M + cur_M_base],
-    //                                 1 /*write*/, 1 /*keep*/);
-    //                             if ((ioff % 4) == 0) {
-    //                                 __builtin_prefetch(
-    //                                     &task_output[feature_offset + LOOKAHEAD * 4],
-    //                                     0 /*read*/, 1 /*keep*/);
-    //                             }
-    //                         }
-    //                         {
-    //                             std::lock_guard<std::mutex> lk(dst_mtx);
-    //                             if (lanes == 4) {
-    //                                 // --------------------------------------------------
-    //                                 // 满4通道路径：纯 NEON，无分支
-    //                                 // task_output 已是 float（fp32），直接 vld1q_f32 加载
-    //                                 // --------------------------------------------------
-    //                                 float32x4_t v_val = vld1q_f32(&task_output[feature_offset]);
-
-    //                                 float* out_ptr = &dst_data[(ioff + i) * M + cur_M_base];
-    //                                 float32x4_t out_old = vld1q_f32(out_ptr);
-    //                                 out_old = vaddq_f32(out_old, v_val);
-    //                                 vst1q_f32(out_ptr, out_old);
-    //                             } else {
-    //                                 // --------------------------------------------------
-    //                                 // 边界路径：剩余 lanes < 4，逐元素处理
-    //                                 // --------------------------------------------------
-    //                                 for (int lane = 0; lane < lanes; lane++) {
-    //                                     float output = task_output[feature_offset + lane];
-    //                                     dst_data[(ioff + i) * M + cur_M_base + lane] += output;
-    //                                 }
-    //                             }
-    //                         }
-    //                         feature_offset += 4; // NCHW4 布局，ioff 每步 +4
-    //                     }
-    //                 }
-                    
-    //             }
-    //         }
-
-    //         {
-
-    //             // auto e_time = ggml_time_us();
-    //             // cpu_time += (e_time - s_time);
-    //             {
-    //                 std::lock_guard<std::mutex> lock(npu_worker_mtx);
-    //                 buffer_free[index].store(0, std::memory_order_release);
-    //                 npu_cv.notify_one();
-    //             }
-    //             index = (index + 1) & 0x1;
-    //         }
-    //         auto e_time_2 = ggml_time_us();
-    //         npu_cpu_time += (e_time_2 - s_time);
-    //         fp_16_index = index;
-    //     }
-    // };
-
-
     auto input_start = input_fp16.data();
     auto weight_start = weight_f16.data();
-    // auto cpu_worker = [&]() {
-    //     while (true) {
-    //         int t = next_task_idx.fetch_add(1, std::memory_order_relaxed);
-    //         if (t >= total_tasks) break;
-    //         const auto [j, k, task] = tasks->at(t);//i是N的索引，j是M的索引，k是K的索引
-    //         auto i = task.I;
-            
-    //         // CPU 直接处理这个 (i, j, k) 分块
-    //         // 这里的计算必须是累加性质的：dst[i, j] += A[i, k] * B[k, j]
-    //         auto cur_n_block_size = std::min(N - i, BLOCK_N_FP16);
-    //         auto cur_m_block_size = std::min(M - j, BLOCK_WEIGHT_FP16);
-    //         {
-    //             std::lock_guard<std::mutex> lk(dst_mtx);
-    //             for (int ii = 0; ii < cur_n_block_size; ++ii) {
-    //                 for (int jj = 0; jj < cur_m_block_size; ++jj) {
-    //                     auto cur_i = i + ii;
-    //                     auto cur_j = j + jj;
-    //                     auto cur_i_addr = input_start + (cur_i * K) + k; // 输入矩阵 A 的地址
-    //                     auto cur_j_addr = weight_start + (cur_j * K) + k; // 权重矩阵 B 的地址
-    //                     float *output = new float(0.0f);
-    //                     ggml_vec_dot_f16(BLOCK_SHARED_FP16, output, 0, cur_i_addr, 0, cur_j_addr, 0, 1);
-    //                     dst_data[cur_i * M + cur_j] += *output;
-    //                     delete output;
-    //                 }
-    //             }
-    //         }
-    //     }
-    // };
     // ── worker 线程：只写自己的 local_dst，完全无锁 ──────────────────────
     auto cpu_worker = [&](std::vector<float>& local_dst) {
+        int cur_task = 0;
         while (true) {
-            int t = next_task_idx.fetch_add(1, std::memory_order_relaxed);
-            if (t >= (int)total_tasks) break;
+            // int t = next_task_idx.fetch_add(1, std::memory_order_relaxed);
+            if (cur_task >= (int)total_tasks) break;
+            bool expected = false;
+            if (!task_taken[cur_task].compare_exchange_strong(expected, true)){
+                cur_task++;
+                continue;
+            }
+            
 
-            std::cout << "cpu processing task " << t << std::endl;
-            const auto [j, k, task] = tasks->at(t);
+            std::cout << "cpu processing task " << cur_task << std::endl;
+            const auto [j, k, task] = tasks->at(cur_task);
             const auto i = task.I;
 
             const int cur_n_block_size = std::min(N - i, BLOCK_N_FP16);
