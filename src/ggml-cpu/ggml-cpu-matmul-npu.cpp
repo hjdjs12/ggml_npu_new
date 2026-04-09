@@ -69,10 +69,10 @@ struct cache_inval_range {
 // Cache prefetch constants
 constexpr int LOOKAHEAD = 12;
 constexpr int PER_TASK_CORE_NUM = 1;
-constexpr int BLOCK_WEIGHT = 2048;
-constexpr int BLOCK_SHARED = 512;  // Match Q8_0 block size for exact dequantization (one scale per task)
-constexpr int BLOCK_WEIGHT_FP16 = 2048; // FP16 版本保持与 BLOCK_SHARED 一致，确保每个任务一个 scale
-constexpr int BLOCK_SHARED_FP16 = 512; // FP16 版本可以使用更大的共享块
+int BLOCK_WEIGHT = 2048;
+int BLOCK_SHARED = 512;  // Match Q8_0 block size for exact dequantization (one scale per task)
+int BLOCK_WEIGHT_FP16 = 2048; // FP16 版本保持与 BLOCK_SHARED 一致，确保每个任务一个 scale
+int BLOCK_SHARED_FP16 = 512; // FP16 版本可以使用更大的共享块
 int BLOCK_N_FP16 = 256; // FP16 版本的 N 块大小
 constexpr uint32_t BATCH_SIZE = 512;
 constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
@@ -1544,8 +1544,7 @@ static void compute_matmul_fp16_parallel(
 
 static std::mutex print_mtx;
 
-
-int get_optimized_n(int M) {
+int get_optimized_n_N(int M) {
     // 1. 确定起始搜索位置：不大于 348 且不大于 M
     int start = std::min(348, M);
     
@@ -1563,6 +1562,45 @@ int get_optimized_n(int M) {
     return 0; // 如果找不到符合条件的 4 的倍数约数
 }
 
+int get_optimized_n_K(int M) {
+    // 1. 确定起始搜索位置：不大于 512 且不大于 M
+    // 这里使用 512 是因为它是 32 的倍数 (32 * 16)
+    int start = std::min(512, M);
+    
+    // 2. 将 start 调整为最接近的、小于等于自己的 32 的倍数
+    // 使用位运算 (start & ~31) 效率更高，或者保持你的逻辑：
+    start = (start / 32) * 32;
+
+    // 3. 向下步进搜索，步长改为 32
+    for (int n = start; n > 0; n -= 32) {
+        // 检查 M 是否能被 n 整除
+        if (M % n == 0) {
+            return n;
+        }
+    }
+
+    return 0; // 如果找不到能整除 M 的 32 的倍数（例如 M < 32 时）
+}
+
+
+int get_optimized_n_M(int M) {
+    // 1. 确定起始搜索位置：不大于 2048 且不大于 M
+    int start = std::min(2048, M);
+    
+    // 2. 将 start 调整为最接近的、小于等于自己的 16 的倍数
+    // 例如 start 为 2047，调整后为 2032
+    start = (start / 16) * 16;
+
+    // 3. 向下步进搜索，步长改为 16
+    for (int n = start; n > 0; n -= 16) {
+        // 检查 M 是否能被 n 整除
+        if (M % n == 0) {
+            return n;
+        }
+    }
+
+    return 0; // 如果找不到能被 16 整除的约数（例如 M < 16 时）
+}
 
 static void compute_matmul_fp16_parallel_dynamic(
     const struct ggml_tensor* src0,  // weight (M x K, Q8_0, pre-quantized with IOMMU)
@@ -1656,7 +1694,9 @@ static void compute_matmul_fp16_parallel_dynamic(
     const int M = src0->ne[1];  // weight rows (output dimension when transposed)
     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
     const int N = src1->ne[1];  // input rows (batch size)
-    BLOCK_N_FP16 = N > 348 ? get_optimized_n(N) : 348;
+    BLOCK_N_FP16 = N > 348 ? get_optimized_n_N(N) : 348;
+    BLOCK_SHARED_FP16 = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
+    BLOCK_WEIGHT_FP16 = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
     // std::cout << "result-size:" << N * M << std::endl;
     
     std::vector<ggml_fp16_t> input_fp16(N * K, 0);
@@ -2643,7 +2683,8 @@ static void compute_matmul_q8_0_parallel(
     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
     const int N = src1->ne[1];  // input rows (batch size)
     const int QK = 512;
-    
+    BLOCK_SHARED = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
+    BLOCK_WEIGHT = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
 
     Domain* domain0 = get_global_domain0();
     // Step 1: Quantize input to Q8_0 (input is FP32, runtime data)
