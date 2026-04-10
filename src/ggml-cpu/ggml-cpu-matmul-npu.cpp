@@ -1609,126 +1609,126 @@ static void compute_matmul_fp16_parallel_dynamic(
     int domain_id) {
     
 
-    // const int M = 1536;  // weight rows (output dimension when transposed)
-    // const int K = 1536;  // weight cols = input cols (shared dimension)
-    // const int N = 512;  // input rows (batch size)
-    // TASKS_LOCAL_PER_NUM = 2; // debug: force single-task submit to isolate core2/slot2 issues
-    // std::vector<ggml_fp16_t> weight_f16(M * K);
+    const int M = 8960;  // weight rows (output dimension when transposed)
+    const int K = 1536;  // weight cols = input cols (shared dimension)
+    const int N = 2400;  // input rows (batch size)
+    TASKS_LOCAL_PER_NUM = 1; // debug: force single-task submit to isolate core2/slot2 issues
+    std::vector<ggml_fp16_t> weight_f16(M * K);
 
-    // // 从 .txt 按行读取，每行一个元素（支持 %a 十六进制浮点）
-    // {
-    //     std::ifstream f_w("/mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt");
-    //     if (!f_w.is_open()) {
-    //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt\n");
-    //     } else {
-    //         std::string line;
-    //         size_t count = 0;
-    //         while (count < (size_t) M * K && std::getline(f_w, line)) {
-    //             char * end = nullptr;
-    //             float v = std::strtof(line.c_str(), &end);
-    //             if (end == line.c_str()) {
-    //                 continue;
-    //             }
-    //             weight_f16[count++] = ggml_fp32_to_fp16(v);
-    //         }
-    //         printf(">>> Loaded weight: %zu / %d elements\n", count, M * K);
-    //     }
-    // }
-
-    // // --- 2. 加载 Input (src1) ---
-    // // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
-    // std::vector<ggml_fp16_t> input_fp16(N * K);
-    // std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
-
-    // {
-    //     std::ifstream f_i("/mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt");
-    //     if (!f_i.is_open()) {
-    //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt\n");
-    //     } else {
-    //         std::string line;
-    //         size_t count = 0;
-    //         while (count < (size_t) N * K && std::getline(f_i, line)) {
-    //             char * end = nullptr;
-    //             float v = std::strtof(line.c_str(), &end);
-    //             if (end == line.c_str()) {
-    //                 continue;
-    //             }
-    //             input_fp32[count++] = v;
-    //         }
-    //         printf(">>> Loaded input: %zu / %d elements\n", count, N * K);
-    //     }
-    // }
-    // // if(src1->type == GGML_TYPE_F16){
-    // //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
-    // // }else{
-    // ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
-    // // }
-    // // --- 1. 打印 Weight (src0) 前 10 个元素 ---
-    // if (!weight_f16.empty()) {
-    //     printf(">>> Weight (src0) first 10 elements:\n  ");
-    //     for (int i = 0; i < 10 && i < (M * K); i++) {
-    //         // 转换并打印
-    //         float val = ggml_fp16_to_fp32(weight_f16[i]);
-    //         printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
-    //         if ((i + 1) % 5 == 0) printf("\n  ");
-    //     }
-    //     printf("\n");
-    // }
-
-    // // --- 2. 打印 Input (src1) 前 10 个元素 ---
-    // if (!input_fp16.empty()) {
-    //     printf(">>> Input (src1) first 10 elements:\n  ");
-    //     for (int i = 0; i < 10 && i < (N * K); i++) {
-    //         // 转换并打印
-    //         float val = ggml_fp16_to_fp32(input_fp16[i]);
-    //         printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
-    //         if ((i + 1) % 5 == 0) printf("\n  ");
-    //     }
-    //     printf("\n");
-    // }
-
-
-
-
-    TASKS_LOCAL_PER_NUM = 1;
-    const int M = src0->ne[1];  // weight rows (output dimension when transposed)
-    const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
-    const int N = src1->ne[1];  // input rows (batch size)
-    BLOCK_N_FP16 = N > 348 ? get_optimized_n_N(N) : 348;
-    BLOCK_SHARED_FP16 = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
-    BLOCK_WEIGHT_FP16 = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
-    // std::cout << "result-size:" << N * M << std::endl;
-    
-    std::vector<ggml_fp16_t> input_fp16(N * K, 0);
-    if(src1->type == GGML_TYPE_F16){
-        memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
-    }else{
-        ggml_cpu_fp32_to_fp16((const float*)src1->data, input_fp16.data(), N * K);
-    }
-
-    std::vector<ggml_fp16_t> weight_f16(M * K, 0);
-
-    if (src0->type == GGML_TYPE_F16) {
-        memcpy(weight_f16.data(), src0->data, M * K * sizeof(ggml_fp16_t));
-    }
-    else if (src0->type == GGML_TYPE_BF16) {
-        fprintf(stderr, "[NPU] Converting Weight: BF16 -> FP16\n");
-        const uint16_t * bf16_ptr = (const uint16_t *)src0->data;
-        for (int i = 0; i < M * K; ++i) {
-            uint32_t f32_bits = (uint32_t)bf16_ptr[i] << 16;
-            float f32;
-            memcpy(&f32, &f32_bits, sizeof(float));
-            weight_f16[i] = ggml_fp32_to_fp16(f32);
+    // 从 .txt 按行读取，每行一个元素（支持 %a 十六进制浮点）
+    {
+        std::ifstream f_w("/mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt");
+        if (!f_w.is_open()) {
+            printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt\n");
+        } else {
+            std::string line;
+            size_t count = 0;
+            while (count < (size_t) M * K && std::getline(f_w, line)) {
+                char * end = nullptr;
+                float v = std::strtof(line.c_str(), &end);
+                if (end == line.c_str()) {
+                    continue;
+                }
+                weight_f16[count++] = ggml_fp32_to_fp16(v);
+            }
+            printf(">>> Loaded weight: %zu / %d elements\n", count, M * K);
         }
     }
-    else if (src0->type == GGML_TYPE_F32) {
-        fprintf(stderr, "[NPU] Converting Weight: FP32 -> FP16\n");
-        ggml_cpu_fp32_to_fp16((const float*)src0->data, weight_f16.data(), M * K);
+
+    // --- 2. 加载 Input (src1) ---
+    // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
+    std::vector<ggml_fp16_t> input_fp16(N * K);
+    std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
+
+    {
+        std::ifstream f_i("/mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt");
+        if (!f_i.is_open()) {
+            printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt\n");
+        } else {
+            std::string line;
+            size_t count = 0;
+            while (count < (size_t) N * K && std::getline(f_i, line)) {
+                char * end = nullptr;
+                float v = std::strtof(line.c_str(), &end);
+                if (end == line.c_str()) {
+                    continue;
+                }
+                input_fp32[count++] = v;
+            }
+            printf(">>> Loaded input: %zu / %d elements\n", count, N * K);
+        }
     }
-    else {
-        fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to FP16, got type %d\n", src0->type);
-        throw std::runtime_error("Weight tensor not pre-quantized");
+    // if(src1->type == GGML_TYPE_F16){
+    //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    // }else{
+    ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
+    // }
+    // --- 1. 打印 Weight (src0) 前 10 个元素 ---
+    if (!weight_f16.empty()) {
+        printf(">>> Weight (src0) first 10 elements:\n  ");
+        for (int i = 0; i < 10 && i < (M * K); i++) {
+            // 转换并打印
+            float val = ggml_fp16_to_fp32(weight_f16[i]);
+            printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
+            if ((i + 1) % 5 == 0) printf("\n  ");
+        }
+        printf("\n");
     }
+
+    // --- 2. 打印 Input (src1) 前 10 个元素 ---
+    if (!input_fp16.empty()) {
+        printf(">>> Input (src1) first 10 elements:\n  ");
+        for (int i = 0; i < 10 && i < (N * K); i++) {
+            // 转换并打印
+            float val = ggml_fp16_to_fp32(input_fp16[i]);
+            printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
+            if ((i + 1) % 5 == 0) printf("\n  ");
+        }
+        printf("\n");
+    }
+
+
+
+
+    // TASKS_LOCAL_PER_NUM = 1;
+    // const int M = src0->ne[1];  // weight rows (output dimension when transposed)
+    // const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
+    // const int N = src1->ne[1];  // input rows (batch size)
+    // BLOCK_N_FP16 = N > 348 ? get_optimized_n_N(N) : 348;
+    // BLOCK_SHARED_FP16 = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
+    // BLOCK_WEIGHT_FP16 = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
+    // // std::cout << "result-size:" << N * M << std::endl;
+    
+    // std::vector<ggml_fp16_t> input_fp16(N * K, 0);
+    // if(src1->type == GGML_TYPE_F16){
+    //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    // }else{
+    //     ggml_cpu_fp32_to_fp16((const float*)src1->data, input_fp16.data(), N * K);
+    // }
+
+    // std::vector<ggml_fp16_t> weight_f16(M * K, 0);
+
+    // if (src0->type == GGML_TYPE_F16) {
+    //     memcpy(weight_f16.data(), src0->data, M * K * sizeof(ggml_fp16_t));
+    // }
+    // else if (src0->type == GGML_TYPE_BF16) {
+    //     fprintf(stderr, "[NPU] Converting Weight: BF16 -> FP16\n");
+    //     const uint16_t * bf16_ptr = (const uint16_t *)src0->data;
+    //     for (int i = 0; i < M * K; ++i) {
+    //         uint32_t f32_bits = (uint32_t)bf16_ptr[i] << 16;
+    //         float f32;
+    //         memcpy(&f32, &f32_bits, sizeof(float));
+    //         weight_f16[i] = ggml_fp32_to_fp16(f32);
+    //     }
+    // }
+    // else if (src0->type == GGML_TYPE_F32) {
+    //     fprintf(stderr, "[NPU] Converting Weight: FP32 -> FP16\n");
+    //     ggml_cpu_fp32_to_fp16((const float*)src0->data, weight_f16.data(), M * K);
+    // }
+    // else {
+    //     fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to FP16, got type %d\n", src0->type);
+    //     throw std::runtime_error("Weight tensor not pre-quantized");
+    // }
     
     auto convert_s_time = ggml_time_us();
     const int K_in = (K + 15) & ~15;
@@ -3025,16 +3025,16 @@ void ggml_compute_forward_mul_mat_npu(
     int domain_id = weight_domain ? weight_domain->id : get_default_domain_id();
     auto start_time = std::chrono::high_resolution_clock::now();
     try {
-        if(type == GGML_TYPE_Q8_0_512) {
-            std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
-            input_type.store(1, std::memory_order_release);
-            compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
-        }else{
-            std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
-            input_type.store(0, std::memory_order_release);
+        // if(type == GGML_TYPE_Q8_0_512) {
+        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
+        //     input_type.store(1, std::memory_order_release);
+        //     compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
+        // }else{
+        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
+        //     input_type.store(0, std::memory_order_release);
             // compute_matmul_fp16_parallel(src0, src1, dst, domain_id);
             compute_matmul_fp16_parallel_dynamic(src0, src1, dst, domain_id);
-        }
+        // }
         // std::cout << "Processing..." << std::flush;         // 不换行仅刷新
         // std::exit(0);
     } catch (const std::exception& e) {
