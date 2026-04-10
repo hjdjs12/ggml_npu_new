@@ -20,6 +20,7 @@
 #include <atomic>
 #include <memory>
 #include <tuple>
+#include <deque>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -234,6 +235,7 @@ static std::thread npu_worker_thread;
 std::vector<std::string> quanted_tensors;
 static std::atomic<int> input_type = 0;
 static std::atomic<uint64_t> g_npu_dump_seq{1};
+static std::atomic<size_t> g_fp16_output_stride_override{0};
 // Forward declarations
 static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id, int output_index);
 static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id, int output_index);
@@ -635,6 +637,41 @@ static void to_npu_feature_layout_fp16(const ggml_fp16_t* src, int M, int K, ggm
     }
 }
 
+static void to_npu_feature_layout_fp16_block_direct(
+    const ggml_fp16_t * src,
+    int src_ld,
+    int src_row0,
+    int src_col0,
+    int M_blk,
+    int K_blk,
+    ggml_fp16_t * dst) {
+    const int K_aligned = (K_blk + 15) & ~15;
+    for (size_t i = 0; i < (size_t) M_blk * K_aligned; i++) {
+        dst[i] = 0;
+    }
+
+    auto cur_dst = dst;
+    for (int j = 0; j < M_blk;) {
+        int _m = std::min((int) BLOCK_N_FP16, M_blk - j);
+        for (int k = 0; k < K_blk;) {
+            int _k = std::min((int) BLOCK_SHARED_FP16, K_blk - k);
+            int start_m = j;
+            int start_k = k;
+            for (int joff = 0; joff < _m; joff++) {
+                for (int koff = 0; koff < _k; koff++) {
+                    auto target = feature_data(_m, 8, koff, joff);
+                    const int src_row = src_row0 + start_m + joff;
+                    const int src_col = src_col0 + start_k + koff;
+                    cur_dst[target] = src[(size_t) src_row * src_ld + src_col];
+                }
+            }
+            cur_dst += _m * _k;
+            k += _k;
+        }
+        j += _m;
+    }
+}
+
 
 static void to_npu_feature_layout(const int8_t* src, int M, int K, int8_t* dst) {
     const int K_aligned = (K + 15) & ~15;
@@ -683,6 +720,41 @@ static void to_npu_weight_layout_fp16(const ggml_fp16_t* src, int M, int K, ggml
                     auto target = weight_fp16(_k, joff, koff);
                     // std::cout << "target: " << target << "   src_offset : " << (joff * K + koff + start_m * K + start_k) << std::endl;
                     cur_dst[target] = src[joff * K + koff + start_m * K + start_k];
+                }
+            }
+            cur_dst += _m * _k;
+            k += _k;
+        }
+        j += _m;
+    }
+}
+
+static void to_npu_weight_layout_fp16_block_direct(
+    const ggml_fp16_t * src,
+    int src_ld,
+    int src_row0,
+    int src_col0,
+    int M_blk,
+    int K_blk,
+    ggml_fp16_t * dst) {
+    const int K_aligned = (K_blk + 31) & ~31;
+    for (size_t i = 0; i < (size_t) M_blk * K_aligned; i++) {
+        dst[i] = 0;
+    }
+
+    auto cur_dst = dst;
+    for (int j = 0; j < M_blk;) {
+        int _m = std::min((int) BLOCK_WEIGHT_FP16, M_blk - j);
+        for (int k = 0; k < K_blk;) {
+            int _k = std::min((int) BLOCK_SHARED_FP16, K_blk - k);
+            int start_m = j;
+            int start_k = k;
+            for (int joff = 0; joff < _m; joff++) {
+                for (int koff = 0; koff < _k; koff++) {
+                    auto target = weight_fp16(_k, joff, koff);
+                    const int src_row = src_row0 + start_m + joff;
+                    const int src_col = src_col0 + start_k + koff;
+                    cur_dst[target] = src[(size_t) src_row * src_ld + src_col];
                 }
             }
             cur_dst += _m * _k;
@@ -1002,6 +1074,7 @@ static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id
     uint64_t off = 0;  // 寄存器命令偏移量
     int task_num = 0;  // 实际任务数量
     size_t per_task_output_stride = 0;  // 固定输出槽位跨度（按本批最大任务）
+    const size_t stride_override = g_fp16_output_stride_override.load(std::memory_order_relaxed);
     
     // ===== 第1步：遍历所有任务，生成寄存器命令 =====
     for (int t = 0; t < PER_TASK_CORE_NUM && tasks.tasks[t].input_dma; t++) {
@@ -1036,7 +1109,9 @@ static rknpu_tasks_result_t rknpu_matmul_fp16(rknpu_tasks_t tasks, int domain_id
         // ✅ 设置输入/权重/输出的 DMA 地址（替代 RegCmd::setupAddr）
         // 同一批次任务的 N 可能不同，必须使用固定槽位跨度避免地址重叠。
         size_t per_task_output_size = (size_t) m * align_up4(n);  // 每个任务输出元素数
-        if (per_task_output_size > per_task_output_stride) {
+        if (stride_override > 0) {
+            per_task_output_stride = stride_override;
+        } else if (per_task_output_size > per_task_output_stride) {
             per_task_output_stride = per_task_output_size;
         }
         uint64_t task_output_dma = output_dma + (t + output_index) * per_task_output_stride * sizeof(float);
@@ -1609,447 +1684,453 @@ static void compute_matmul_fp16_parallel_dynamic(
     int domain_id) {
     
 
-    const int M = 8960;  // weight rows (output dimension when transposed)
-    const int K = 1536;  // weight cols = input cols (shared dimension)
-    const int N = 2400;  // input rows (batch size)
-    TASKS_LOCAL_PER_NUM = 1; // debug: force single-task submit to isolate core2/slot2 issues
-    std::vector<ggml_fp16_t> weight_f16(M * K);
-
-    // 从 .txt 按行读取，每行一个元素（支持 %a 十六进制浮点）
-    {
-        std::ifstream f_w("/mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt");
-        if (!f_w.is_open()) {
-            printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/weights/443.txt\n");
-        } else {
-            std::string line;
-            size_t count = 0;
-            while (count < (size_t) M * K && std::getline(f_w, line)) {
-                char * end = nullptr;
-                float v = std::strtof(line.c_str(), &end);
-                if (end == line.c_str()) {
-                    continue;
-                }
-                weight_f16[count++] = ggml_fp32_to_fp16(v);
-            }
-            printf(">>> Loaded weight: %zu / %d elements\n", count, M * K);
-        }
-    }
-
-    // --- 2. 加载 Input (src1) ---
-    // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
-    std::vector<ggml_fp16_t> input_fp16(N * K);
-    std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
-
-    {
-        std::ifstream f_i("/mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt");
-        if (!f_i.is_open()) {
-            printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/inputs/443.txt\n");
-        } else {
-            std::string line;
-            size_t count = 0;
-            while (count < (size_t) N * K && std::getline(f_i, line)) {
-                char * end = nullptr;
-                float v = std::strtof(line.c_str(), &end);
-                if (end == line.c_str()) {
-                    continue;
-                }
-                input_fp32[count++] = v;
-            }
-            printf(">>> Loaded input: %zu / %d elements\n", count, N * K);
-        }
-    }
-    // if(src1->type == GGML_TYPE_F16){
-    //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
-    // }else{
-    ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
-    // }
-    // --- 1. 打印 Weight (src0) 前 10 个元素 ---
-    if (!weight_f16.empty()) {
-        printf(">>> Weight (src0) first 10 elements:\n  ");
-        for (int i = 0; i < 10 && i < (M * K); i++) {
-            // 转换并打印
-            float val = ggml_fp16_to_fp32(weight_f16[i]);
-            printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
-            if ((i + 1) % 5 == 0) printf("\n  ");
-        }
-        printf("\n");
-    }
-
-    // --- 2. 打印 Input (src1) 前 10 个元素 ---
-    if (!input_fp16.empty()) {
-        printf(">>> Input (src1) first 10 elements:\n  ");
-        for (int i = 0; i < 10 && i < (N * K); i++) {
-            // 转换并打印
-            float val = ggml_fp16_to_fp32(input_fp16[i]);
-            printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
-            if ((i + 1) % 5 == 0) printf("\n  ");
-        }
-        printf("\n");
-    }
-
-
-
-
-    // TASKS_LOCAL_PER_NUM = 1;
-    // const int M = src0->ne[1];  // weight rows (output dimension when transposed)
-    // const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
-    // const int N = src1->ne[1];  // input rows (batch size)
+    // const int M = 8960;  // weight rows (output dimension when transposed)
+    // const int K = 1536;  // weight cols = input cols (shared dimension)
+    // const int N = 2400;  // input rows (batch size)
+    // TASKS_LOCAL_PER_NUM = 1; // debug: force single-task submit to isolate core2/slot2 issues
     // BLOCK_N_FP16 = N > 348 ? get_optimized_n_N(N) : 348;
     // BLOCK_SHARED_FP16 = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
     // BLOCK_WEIGHT_FP16 = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
-    // // std::cout << "result-size:" << N * M << std::endl;
-    
-    // std::vector<ggml_fp16_t> input_fp16(N * K, 0);
-    // if(src1->type == GGML_TYPE_F16){
-    //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
-    // }else{
-    //     ggml_cpu_fp32_to_fp16((const float*)src1->data, input_fp16.data(), N * K);
-    // }
+    // std::vector<ggml_fp16_t> weight_f16(M * K);
 
-    // std::vector<ggml_fp16_t> weight_f16(M * K, 0);
-
-    // if (src0->type == GGML_TYPE_F16) {
-    //     memcpy(weight_f16.data(), src0->data, M * K * sizeof(ggml_fp16_t));
-    // }
-    // else if (src0->type == GGML_TYPE_BF16) {
-    //     fprintf(stderr, "[NPU] Converting Weight: BF16 -> FP16\n");
-    //     const uint16_t * bf16_ptr = (const uint16_t *)src0->data;
-    //     for (int i = 0; i < M * K; ++i) {
-    //         uint32_t f32_bits = (uint32_t)bf16_ptr[i] << 16;
-    //         float f32;
-    //         memcpy(&f32, &f32_bits, sizeof(float));
-    //         weight_f16[i] = ggml_fp32_to_fp16(f32);
+    // // 从 .txt 按行读取，每行一个元素（支持 %a 十六进制浮点）
+    // {
+    //     std::ifstream f_w("/mnt/nvme/stable-diffusion-new2.cpp/weights/547.txt");
+    //     if (!f_w.is_open()) {
+    //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/weights/547.txt\n");
+    //     } else {
+    //         std::string line;
+    //         size_t count = 0;
+    //         while (count < (size_t) M * K && std::getline(f_w, line)) {
+    //             char * end = nullptr;
+    //             float v = std::strtof(line.c_str(), &end);
+    //             if (end == line.c_str()) {
+    //                 continue;
+    //             }
+    //             weight_f16[count++] = ggml_fp32_to_fp16(v);
+    //         }
+    //         printf(">>> Loaded weight: %zu / %d elements\n", count, M * K);
     //     }
     // }
-    // else if (src0->type == GGML_TYPE_F32) {
-    //     fprintf(stderr, "[NPU] Converting Weight: FP32 -> FP16\n");
-    //     ggml_cpu_fp32_to_fp16((const float*)src0->data, weight_f16.data(), M * K);
+
+    // // --- 2. 加载 Input (src1) ---
+    // // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
+    // std::vector<ggml_fp16_t> input_fp16(N * K);
+    // std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
+
+    // {
+    //     std::ifstream f_i("/mnt/nvme/stable-diffusion-new2.cpp/inputs/547.txt");
+    //     if (!f_i.is_open()) {
+    //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/inputs/547.txt\n");
+    //     } else {
+    //         std::string line;
+    //         size_t count = 0;
+    //         while (count < (size_t) N * K && std::getline(f_i, line)) {
+    //             char * end = nullptr;
+    //             float v = std::strtof(line.c_str(), &end);
+    //             if (end == line.c_str()) {
+    //                 continue;
+    //             }
+    //             input_fp32[count++] = v;
+    //         }
+    //         printf(">>> Loaded input: %zu / %d elements\n", count, N * K);
+    //     }
     // }
-    // else {
-    //     fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to FP16, got type %d\n", src0->type);
-    //     throw std::runtime_error("Weight tensor not pre-quantized");
+    // // if(src1->type == GGML_TYPE_F16){
+    // //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    // // }else{
+    // ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
+    // // }
+    // // --- 1. 打印 Weight (src0) 前 10 个元素 ---
+    // if (!weight_f16.empty()) {
+    //     printf(">>> Weight (src0) first 10 elements:\n  ");
+    //     for (int i = 0; i < 10 && i < (M * K); i++) {
+    //         // 转换并打印
+    //         float val = ggml_fp16_to_fp32(weight_f16[i]);
+    //         printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
+    //         if ((i + 1) % 5 == 0) printf("\n  ");
+    //     }
+    //     printf("\n");
     // }
+
+    // // --- 2. 打印 Input (src1) 前 10 个元素 ---
+    // if (!input_fp16.empty()) {
+    //     printf(">>> Input (src1) first 10 elements:\n  ");
+    //     for (int i = 0; i < 10 && i < (N * K); i++) {
+    //         // 转换并打印
+    //         float val = ggml_fp16_to_fp32(input_fp16[i]);
+    //         printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
+    //         if ((i + 1) % 5 == 0) printf("\n  ");
+    //     }
+    //     printf("\n");
+    // }
+
+
+
+
+    TASKS_LOCAL_PER_NUM = 1;
+    const int M = src0->ne[1];  // weight rows (output dimension when transposed)
+    const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
+    const int N = src1->ne[1];  // input rows (batch size)
+    BLOCK_N_FP16 = N > 348 ? get_optimized_n_N(N) : 348;
+    BLOCK_SHARED_FP16 = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
+    BLOCK_WEIGHT_FP16 = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
+    // std::cout << "result-size:" << N * M << std::endl;
+    
+    std::vector<ggml_fp16_t> input_fp16(N * K, 0);
+    if(src1->type == GGML_TYPE_F16){
+        memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    }else{
+        ggml_cpu_fp32_to_fp16((const float*)src1->data, input_fp16.data(), N * K);
+    }
+
+    std::vector<ggml_fp16_t> weight_f16(M * K, 0);
+
+    if (src0->type == GGML_TYPE_F16) {
+        memcpy(weight_f16.data(), src0->data, M * K * sizeof(ggml_fp16_t));
+    }
+    else if (src0->type == GGML_TYPE_BF16) {
+        fprintf(stderr, "[NPU] Converting Weight: BF16 -> FP16\n");
+        const uint16_t * bf16_ptr = (const uint16_t *)src0->data;
+        for (int i = 0; i < M * K; ++i) {
+            uint32_t f32_bits = (uint32_t)bf16_ptr[i] << 16;
+            float f32;
+            memcpy(&f32, &f32_bits, sizeof(float));
+            weight_f16[i] = ggml_fp32_to_fp16(f32);
+        }
+    }
+    else if (src0->type == GGML_TYPE_F32) {
+        fprintf(stderr, "[NPU] Converting Weight: FP32 -> FP16\n");
+        ggml_cpu_fp32_to_fp16((const float*)src0->data, weight_f16.data(), M * K);
+    }
+    else {
+        fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to FP16, got type %d\n", src0->type);
+        throw std::runtime_error("Weight tensor not pre-quantized");
+    }
     
     auto convert_s_time = ggml_time_us();
-    const int K_in = (K + 15) & ~15;
-    const int K_w = (K + 31) & ~31;
-    
-    std::vector<ggml_fp16_t> input_npu(N * K_in, 0);
-    to_npu_feature_layout_fp16(input_fp16.data(), N, K, input_npu.data());
-    
-    // Step 4: Get global domain0 and use its weight/input LeftMemory buffers
+
     Domain* domain = get_global_domain0();
-    if (!domain) {
-        fprintf(stderr, "[NPU] ERROR: Global domain0 not initialized\n");
-        throw std::runtime_error("Global domain0 not initialized");
+    if (!domain || !domain->input || !domain->weight) {
+        fprintf(stderr, "[NPU] ERROR: Global domain0/input/weight not initialized\n");
+        throw std::runtime_error("Global domain0 buffers not initialized");
     }
-    
-    // Check weight buffer size and store layout result in domain0->weight
-    size_t weight_layout_size = M * K_w * sizeof(ggml_fp16_t);
-    if (weight_layout_size > domain->weight->size) {
-        fprintf(stderr, "[NPU] ERROR: Weight size %zu exceeds domain0 weight buffer %zu\n", 
-                weight_layout_size, domain->weight->size);
-        throw std::runtime_error("Weight buffer overflow");
+
+    float * dst_data = (float *) dst->data;
+    std::fill(dst_data, dst_data + N * M, 0.0f);
+
+    uint64_t layout_time = 0;
+    uint64_t npu_time = 0;
+    uint64_t cpu_time = 0;
+    int task_count = 0;
+
+    auto consume_fp16_output = [&](int i, int j, int current_n_task, int current_m_task, float * task_output) {
+        invalid_cache(task_output, (uint64_t) current_n_task * align_up4(current_m_task) * sizeof(float));
+
+    #pragma omp parallel for num_threads(4)
+        for (int joff = 0; joff < current_m_task; joff += 4) {
+            const int cur_M_base = j + joff;
+            const int lanes = std::min(4, current_m_task - joff);
+            int feature_offset = feature_data(current_n_task, 4, joff, 0);
+
+            for (int ioff = 0; ioff < current_n_task; ioff++) {
+                if (ioff + LOOKAHEAD < current_n_task) {
+                    __builtin_prefetch(
+                        &dst_data[(ioff + i + LOOKAHEAD) * M + cur_M_base],
+                        1,
+                        1);
+                    if ((ioff % 4) == 0) {
+                        __builtin_prefetch(
+                            &task_output[feature_offset + LOOKAHEAD * 4],
+                            0,
+                            1);
+                    }
+                }
+
+                if (lanes == 4) {
+                    float32x4_t v_val = vld1q_f32(&task_output[feature_offset]);
+                    float * out_ptr = &dst_data[(ioff + i) * M + cur_M_base];
+                    float32x4_t out_old = vld1q_f32(out_ptr);
+                    out_old = vaddq_f32(out_old, v_val);
+                    vst1q_f32(out_ptr, out_old);
+                } else {
+                    for (int lane = 0; lane < lanes; lane++) {
+                        dst_data[(ioff + i) * M + cur_M_base + lane] += task_output[feature_offset + lane];
+                    }
+                }
+
+                feature_offset += 4;
+            }
+        }
+    };
+
+    struct prepared_task_t {
+        int i;
+        int j;
+        int k;
+        int n_i;
+        int n;
+        int k_blk;
+        int w_id;
+        size_t input_bytes;
+        size_t weight_bytes;
+        std::vector<ggml_fp16_t> input_layout;
+        std::shared_ptr<std::vector<ggml_fp16_t>> weight_layout;
+    };
+
+    struct npu_done_task_t {
+        int i;
+        int j;
+        int k;
+        int n_i;
+        int n;
+        int slot;
+        float * output;
+    };
+
+    const int max_k_in_blk = (BLOCK_SHARED_FP16 + 15) & ~15;
+    const int max_k_w_blk = (BLOCK_SHARED_FP16 + 31) & ~31;
+    const size_t max_input_bytes = (size_t) BLOCK_N_FP16 * max_k_in_blk * sizeof(ggml_fp16_t);
+    const size_t max_weight_bytes = (size_t) BLOCK_WEIGHT_FP16 * max_k_w_blk * sizeof(ggml_fp16_t);
+    if (max_input_bytes > domain->input->size) {
+        fprintf(stderr, "[NPU] ERROR: max input block %zu exceeds input buffer %zu\n", max_input_bytes, domain->input->size);
+        throw std::runtime_error("Input block overflow");
     }
-    
-    // Convert FP16 weight to NPU layout and store in domain0->weight LeftMemory
-    fprintf(stderr, "[NPU] Converting weight to NPU layout and storing in domain0->weight buffer...\n");
-    std::vector<ggml_fp16_t> weight_layout(M * K_w, 0);
-    to_npu_weight_layout_fp16(weight_f16.data(), M, K, weight_layout.data());
-    memcpy(domain->weight->virtual_addr, weight_layout.data(), weight_layout_size);
-    flush_cache(domain->weight->virtual_addr, weight_layout_size);
-    uint64_t weight_dma_base = domain->weight->iommu_addr;
-    
-    fprintf(stderr, "[NPU] Weight stored in domain0: VA=%p, DMA=0x%lx, size=%zu\n",
-            domain->weight->virtual_addr, weight_dma_base, weight_layout_size);
-    
+    if (max_weight_bytes > domain->weight->size) {
+        fprintf(stderr, "[NPU] ERROR: max weight block %zu exceeds weight buffer %zu\n", max_weight_bytes, domain->weight->size);
+        throw std::runtime_error("Weight block overflow");
+    }
+
+    constexpr int SLOT_COUNT = 4;
+    const size_t output_stride = (size_t) BLOCK_N_FP16 * align_up4(BLOCK_WEIGHT_FP16);
+    if (output_stride * SLOT_COUNT * sizeof(float) > domain->output->size) {
+        fprintf(stderr, "[NPU] ERROR: output slots exceed output buffer\n");
+        throw std::runtime_error("Output slot overflow");
+    }
+
+    g_fp16_output_stride_override.store(output_stride, std::memory_order_relaxed);
+
+    std::deque<prepared_task_t> q_prepared;
+    std::deque<npu_done_task_t> q_done;
+    std::deque<int> q_free_slots;
+    for (int s = 0; s < SLOT_COUNT; ++s) {
+        q_free_slots.push_back(s);
+    }
+
+    std::mutex m_prepared;
+    std::mutex m_done;
+    std::mutex m_slots;
+    std::mutex m_err;
+    std::condition_variable cv_prepared;
+    std::condition_variable cv_done;
+    std::condition_variable cv_slots;
+    std::atomic<bool> prep_done{false};
+    std::atomic<bool> npu_done{false};
+    std::atomic<bool> abort_pipeline{false};
+    std::string err_msg;
+
+    auto set_error = [&](const std::string & msg) {
+        bool expected = false;
+        if (abort_pipeline.compare_exchange_strong(expected, true)) {
+            std::lock_guard<std::mutex> lk(m_err);
+            err_msg = msg;
+        }
+        cv_prepared.notify_all();
+        cv_done.notify_all();
+        cv_slots.notify_all();
+    };
+
+    std::atomic<uint64_t> layout_time_acc{0};
+    std::atomic<uint64_t> npu_time_acc{0};
+    std::atomic<uint64_t> cpu_time_acc{0};
+    std::atomic<int> task_count_acc{0};
+
+    std::thread threadA([&]() {
+        auto t0 = ggml_time_us();
+        int w_id = 0;
+        for (int j = 0; j < M && !abort_pipeline.load(std::memory_order_relaxed); j += BLOCK_WEIGHT_FP16) {
+            const int _n = std::min(M - j, BLOCK_WEIGHT_FP16);
+            for (int k = 0; k < K && !abort_pipeline.load(std::memory_order_relaxed); k += BLOCK_SHARED_FP16, ++w_id) {
+                const int _k = std::min(K - k, BLOCK_SHARED_FP16);
+                const int k_w_blk = (_k + 31) & ~31;
+                const size_t weight_bytes = (size_t) _n * k_w_blk * sizeof(ggml_fp16_t);
+
+                auto w_layout = std::make_shared<std::vector<ggml_fp16_t>>((size_t) _n * k_w_blk);
+                to_npu_weight_layout_fp16_block_direct(
+                    weight_f16.data(),
+                    K,
+                    j,
+                    k,
+                    _n,
+                    _k,
+                    w_layout->data());
+
+                for (int i = 0; i < N && !abort_pipeline.load(std::memory_order_relaxed); i += BLOCK_N_FP16) {
+                    const int _n_i = std::min(N - i, BLOCK_N_FP16);
+                    const int k_in_blk = (_k + 15) & ~15;
+                    const size_t input_bytes = (size_t) _n_i * k_in_blk * sizeof(ggml_fp16_t);
+
+                    prepared_task_t task = {};
+                    task.i = i;
+                    task.j = j;
+                    task.k = k;
+                    task.n_i = _n_i;
+                    task.n = _n;
+                    task.k_blk = _k;
+                    task.w_id = w_id;
+                    task.input_bytes = input_bytes;
+                    task.weight_bytes = weight_bytes;
+                    task.weight_layout = w_layout;
+                    task.input_layout.resize((size_t) _n_i * k_in_blk);
+                    to_npu_feature_layout_fp16_block_direct(
+                        input_fp16.data(),
+                        K,
+                        i,
+                        k,
+                        _n_i,
+                        _k,
+                        task.input_layout.data());
+
+                    {
+                        std::lock_guard<std::mutex> lk(m_prepared);
+                        q_prepared.push_back(std::move(task));
+                    }
+                    cv_prepared.notify_one();
+                }
+            }
+        }
+        auto t1 = ggml_time_us();
+        layout_time_acc.fetch_add((uint64_t) (t1 - t0), std::memory_order_relaxed);
+        prep_done.store(true, std::memory_order_release);
+        cv_prepared.notify_all();
+    });
+
+    std::thread threadB([&]() {
+        int last_w_id = -1;
+        while (!abort_pipeline.load(std::memory_order_relaxed)) {
+            prepared_task_t task = {};
+            {
+                std::unique_lock<std::mutex> lk(m_prepared);
+                cv_prepared.wait(lk, [&]() {
+                    return abort_pipeline.load(std::memory_order_relaxed) || !q_prepared.empty() || prep_done.load(std::memory_order_acquire);
+                });
+                if (abort_pipeline.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (q_prepared.empty()) {
+                    break;
+                }
+                task = std::move(q_prepared.front());
+                q_prepared.pop_front();
+            }
+
+            int slot = 0;
+            {
+                std::unique_lock<std::mutex> lk(m_slots);
+                cv_slots.wait(lk, [&]() {
+                    return abort_pipeline.load(std::memory_order_relaxed) || !q_free_slots.empty();
+                });
+                if (abort_pipeline.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                slot = q_free_slots.front();
+                q_free_slots.pop_front();
+            }
+
+            if (last_w_id != task.w_id) {
+                memcpy(domain->weight->virtual_addr, task.weight_layout->data(), task.weight_bytes);
+                flush_cache(domain->weight->virtual_addr, task.weight_bytes);
+                last_w_id = task.w_id;
+            }
+
+            memcpy(domain->input->virtual_addr, task.input_layout.data(), task.input_bytes);
+            flush_cache(domain->input->virtual_addr, task.input_bytes);
+
+            rknpu_tasks_t one_task = {};
+            one_task.tasks[0] = matmul_task_t{
+                domain->input->iommu_addr,
+                domain->weight->iommu_addr,
+                task.n_i,
+                task.k_blk,
+                task.n,
+                task.i,
+            };
+
+            auto npu_s = ggml_time_us();
+            auto outq = rknpu_matmul_fp16(one_task, domain_id, slot);
+            auto npu_e = ggml_time_us();
+            npu_time_acc.fetch_add((uint64_t) (npu_e - npu_s), std::memory_order_relaxed);
+
+            float * out_ptr = outq.output_fp16[0];
+            if (out_ptr == nullptr) {
+                set_error("NPU returned null output");
+                break;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(m_done);
+                q_done.push_back(npu_done_task_t{task.i, task.j, task.k, task.n_i, task.n, slot, out_ptr});
+            }
+            cv_done.notify_one();
+        }
+
+        npu_done.store(true, std::memory_order_release);
+        cv_done.notify_all();
+    });
+
+    std::thread threadC([&]() {
+        while (!abort_pipeline.load(std::memory_order_relaxed)) {
+            npu_done_task_t done_task = {};
+            {
+                std::unique_lock<std::mutex> lk(m_done);
+                cv_done.wait(lk, [&]() {
+                    return abort_pipeline.load(std::memory_order_relaxed) || !q_done.empty() || npu_done.load(std::memory_order_acquire);
+                });
+                if (abort_pipeline.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (q_done.empty()) {
+                    break;
+                }
+                done_task = q_done.front();
+                q_done.pop_front();
+            }
+
+            auto cpu_s = ggml_time_us();
+            consume_fp16_output(done_task.i, done_task.j, done_task.n_i, done_task.n, done_task.output);
+            auto cpu_e = ggml_time_us();
+            cpu_time_acc.fetch_add((uint64_t) (cpu_e - cpu_s), std::memory_order_relaxed);
+            task_count_acc.fetch_add(1, std::memory_order_relaxed);
+
+            {
+                std::lock_guard<std::mutex> lk(m_slots);
+                q_free_slots.push_back(done_task.slot);
+            }
+            cv_slots.notify_one();
+        }
+    });
+
+    threadA.join();
+    threadB.join();
+    threadC.join();
+
+    g_fp16_output_stride_override.store(0, std::memory_order_relaxed);
+
+    if (abort_pipeline.load(std::memory_order_relaxed)) {
+        throw std::runtime_error(err_msg.empty() ? "pipeline aborted" : err_msg);
+    }
+
+    layout_time += layout_time_acc.load(std::memory_order_relaxed);
+    npu_time += npu_time_acc.load(std::memory_order_relaxed);
+    cpu_time += cpu_time_acc.load(std::memory_order_relaxed);
+    task_count += task_count_acc.load(std::memory_order_relaxed);
 
     auto convert_e_time = ggml_time_us();
-    std::cout << "Layout conversion time: " << (convert_e_time - convert_s_time) / 1000.0 << " ms" << std::endl;
-    
-    // ✅ Step 4.5: Store input layout result in domain0->input LeftMemory
-    size_t input_layout_size = N * K_in * sizeof(ggml_fp16_t);
-    if (input_layout_size > domain->input->size) {
-        fprintf(stderr, "[NPU] ERROR: Input size %zu exceeds domain0 input buffer %zu\n", 
-                input_layout_size, domain->input->size);
-        throw std::runtime_error("Input buffer overflow");
-    }
-    
-    // Copy layout input to domain0->input LeftMemory
-    memcpy(domain->input->virtual_addr, input_npu.data(), input_layout_size);
-    flush_cache(domain->input->virtual_addr, input_layout_size);
-    uint64_t input_dma_base = domain->input->iommu_addr;
-    
-    fprintf(stderr, "[NPU] Input stored in domain0: VA=%p, DMA=0x%lx, size=%zu\n", 
-            domain->input->virtual_addr, input_dma_base, input_layout_size);
-    
-    
-    // Step 5: Build task list (block splitting)
-    auto tasks = std::make_shared<std::vector<std::tuple<int, int, matmul_task_t>>>();
-    // tasks->reserve(ceil_int(M, BLOCK_WEIGHT_FP16) * ceil_int(K, BLOCK_SHARED_FP16));
-    tasks->reserve(ceil_int(M, BLOCK_WEIGHT_FP16) * ceil_int(K, BLOCK_SHARED_FP16) * ceil_int(N, BLOCK_N_FP16));
-
-    // for (int j = 0; j < M; j += BLOCK_WEIGHT_FP16) {
-    //     int _n = std::min(M - j, BLOCK_WEIGHT_FP16);
-    //     for (int k = 0; k < K; k += BLOCK_SHARED_FP16) {
-    //         int _k = std::min(K - k, BLOCK_SHARED_FP16);
-        
-    //         tasks->emplace_back(j, k, matmul_task_t{
-    //             input_dma_base, weight_dma_base, N, _k, _n
-    //         });
-    //         input_dma_base += N * _k * sizeof(ggml_fp16_t) ;
-    //         weight_dma_base += _k * _n * sizeof(ggml_fp16_t);
-    //     }
-    //     input_dma_base = input_domain->input->iommu_addr;
-    // }
-    for (int i = 0; i < N; i += BLOCK_N_FP16) {
-        int _n_i = std::min(N - i, BLOCK_N_FP16);
-        uint64_t cur_input_start = input_dma_base;
-        uint64_t cur_weight_start = weight_dma_base;
-        // 要修改input块内的to_layout逻辑
-        for (int j = 0; j < M; j += BLOCK_WEIGHT_FP16) {
-            int _n = std::min(M - j, BLOCK_WEIGHT_FP16);
-            for (int k = 0; k < K; k += BLOCK_SHARED_FP16) {
-                int _k = std::min(K - k, BLOCK_SHARED_FP16);
-            
-                tasks->emplace_back(j, k, matmul_task_t{
-                    input_dma_base, weight_dma_base, _n_i, _k, _n, i
-                });
-                input_dma_base += _n_i * _k * sizeof(ggml_fp16_t) ;
-                weight_dma_base += _k * _n * sizeof(ggml_fp16_t);
-            }
-            input_dma_base = cur_input_start;
-        }
-        weight_dma_base = cur_weight_start;
-        input_dma_base += _n_i * K * sizeof(ggml_fp16_t);
-    }
-
-    for (int t = 0; t < (int)tasks->size(); t++) {
-        matmul_task_t task = std::get<2>(tasks->at(t));
-        std::cout << "Task " << t << ": (" << std::get<0>(tasks->at(t)) << ", " << std::get<1>(tasks->at(t)) << ")" << std::endl;
-    }
-
-    // Step 7: Initialize output to zero
-    std::fill((float*)dst->data, (float*)dst->data + N * M, 0.0f);
-    
-    // // Step 8: Submit tasks to NPU worker thread
-    {
-        std::lock_guard<std::mutex> lock(npu_worker_mtx);
-        tasks_list.push_back(tasks);
-        npu_domain_id = domain_id;
-        npu_cv.notify_one();
-    }
-    auto submit_time = ggml_time_us();
-    std::cout << "Tasks submit, time: " << (submit_time - convert_e_time) / 1000.0 << " ms" << std::endl;
-    // Step 9: CPU processes NPU output with double buffering
-    int index = 0;
-    float* dst_data = (float*)dst->data;
-    uint64_t npu_wait_time = 0;
-    uint64_t npu_cpu_time = 0;
-    uint64_t cpu_time = 0;
-    std::cout << "task_size: " << tasks->size() << std::endl; 
-
-    std::mutex dst_mtx; // 保护 dst 的累加操作
-    std::atomic<int> next_task_idx{0};
-    
-    auto total_tasks = tasks->size();
-    std::vector<std::atomic<bool>> task_taken(total_tasks);
-
-    auto npu_worker = [&]() {
-        for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
-            {
-                auto s_time = ggml_time_us();
-                std::unique_lock<std::mutex> lock(cpu_worker_mtx);
-                cpu_cv.wait(lock, [&] { 
-                    return npu_tasks_shared_fp16.use_count() != 0 && 
-                        npu_tasks_shared_fp16->at(t) != nullptr && 
-                        buffer_free[index].load(std::memory_order_acquire) == 1;
-                });
-                auto e_time = ggml_time_us();
-                npu_wait_time += (e_time - s_time);
-            }
-
-            auto s_time = ggml_time_us();
-            bool flag = true;
-            for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
-                
-                // if(t + toff != next_task_idx.load(std::memory_order_relaxed) && flag){
-                //     continue;
-                // }
-                // if (flag) {
-                //     next_task_idx.fetch_add(TASKS_LOCAL_PER_NUM - toff, std::memory_order_relaxed);
-                //     flag = false;
-                // }
-                bool expected = false;
-                if (!task_taken[t + toff].compare_exchange_strong(expected, true)){
-                    continue;
-                }
-                std::cout << "npu processing task :" << t + toff << std::endl;
-
-                const auto [j, k, task] = tasks->at(t + toff);
-                auto i = task.I;
-                float* task_output = npu_tasks_shared_fp16->at(t + toff);
-
-                int current_m_task = std::min(M - j, BLOCK_WEIGHT_FP16);
-                int current_n_task = std::min(N - i, BLOCK_N_FP16);
-                invalid_cache(task_output, (uint64_t) current_n_task * align_up4(current_m_task) * sizeof(float));
-
-                // ---------------------------------------------------------------
-                // 外层按 joff 步长4并行，对齐 int8 风格
-                // NPU 输出布局: NCHW4，H=current_n_task，W_block=4
-                // feature_data(current_n_task, 4, joff, ioff) 随 ioff 每次 +4
-                // ---------------------------------------------------------------
-        #pragma omp parallel for num_threads(4)
-                for (int joff = 0; joff < current_m_task; joff += 4) {
-                    const int cur_M_base = j + joff;
-                    const int lanes = std::min(4, current_m_task - joff);
-
-                    // 初始 feature_offset，ioff=0 时的偏移
-                    int feature_offset = feature_data(current_n_task, 4, joff, 0);
-
-                    for (int ioff = 0; ioff < current_n_task; ioff++) {
-                        // Prefetch 下一行 dst 写目标 和 NPU 输出
-                        if (ioff + LOOKAHEAD < current_n_task) {
-                            __builtin_prefetch(
-                                &dst_data[(ioff + i + LOOKAHEAD) * M + cur_M_base],
-                                1 /*write*/, 1 /*keep*/);
-                            if ((ioff % 4) == 0) {
-                                __builtin_prefetch(
-                                    &task_output[feature_offset + LOOKAHEAD * 4],
-                                    0 /*read*/, 1 /*keep*/);
-                            }
-                        }
-
-                        if (lanes == 4) {
-                            // --------------------------------------------------
-                            // 满4通道路径：纯 NEON，无分支
-                            // task_output 已是 float（fp32），直接 vld1q_f32 加载
-                            // --------------------------------------------------
-                            // // 调试输出：打印每个通道的 offset_in_result 和 value
-                            // for (int lane = 0; lane < 4; lane++) {
-                            //     int cur_offset_in_result = (ioff + i) * M + cur_M_base + lane;
-                            //     float value = task_output[feature_offset + lane];
-                            //     int cur_i = ioff + i;
-                            //     int cur_M = cur_M_base + lane;
-                            //     {
-                            //         std::lock_guard<std::mutex> lock(print_mtx); // 锁住直到花括号结束
-                            //         std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:" << task_output[feature_offset + lane] << "    cur_i:" << cur_i <<"     i:"<< i << "    ioff:" << ioff << "    cur_M:" << cur_M << std::endl;
-                            //     }
-                            // }
-                            float32x4_t v_val = vld1q_f32(&task_output[feature_offset]);
-
-                            float* out_ptr = &dst_data[(ioff + i) * M + cur_M_base];
-                            float32x4_t out_old = vld1q_f32(out_ptr);
-                            out_old = vaddq_f32(out_old, v_val);
-                            vst1q_f32(out_ptr, out_old);
-                            
-
-                        } else {
-                            // --------------------------------------------------
-                            // 边界路径：剩余 lanes < 4，逐元素处理
-                            // --------------------------------------------------
-                            for (int lane = 0; lane < lanes; lane++) {
-                                float output = task_output[feature_offset + lane];
-                                int cur_offset_in_result = (ioff + i) * M + cur_M_base + lane;
-                                int cur_i = ioff + i;
-                                int cur_M = cur_M_base + lane;
-                                // {
-                                //     std::lock_guard<std::mutex> lock(print_mtx); // 锁住直到花括号结束
-                                //     std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:" << task_output[feature_offset + lane] << "    cur_i:" << cur_i <<"     i:"<< i << "    ioff:" << ioff << "    cur_M:" << cur_M << std::endl;
-                                // }
-                                dst_data[(ioff + i) * M + cur_M_base + lane] += output;
-                            }
-                        }
-
-                        feature_offset += 4; // NCHW4 布局，ioff 每步 +4
-                    }
-                }
-            }
-
-            auto e_time = ggml_time_us();
-            npu_cpu_time += (e_time - s_time);
-
-            {
-                std::lock_guard<std::mutex> lock(npu_worker_mtx);
-                buffer_free[index].store(0, std::memory_order_release);
-                npu_cv.notify_one();
-            }
-            index = (index + 1) & 0x1;
-        }
-    };
-    auto input_start = input_fp16.data();
-    auto weight_start = weight_f16.data();
-    // ── worker 线程：只写自己的 local_dst，完全无锁 ──────────────────────
-    auto cpu_worker = [&](std::vector<float>& local_dst) {
-        int cur_task = 0;
-        while (true) {
-            // int t = next_task_idx.fetch_add(1, std::memory_order_relaxed);
-            if (cur_task >= (int)total_tasks) break;
-            bool expected = false;
-            if (!task_taken[cur_task].compare_exchange_strong(expected, true)){
-                cur_task++;
-                continue;
-            }
-            
-
-            std::cout << "cpu processing task " << cur_task << std::endl;
-            const auto [j, k, task] = tasks->at(cur_task);
-            const auto i = task.I;
-
-            const int cur_n_block_size = std::min(N - i, BLOCK_N_FP16);
-            const int cur_m_block_size = std::min(M - j, BLOCK_WEIGHT_FP16);
-
-    #pragma omp parallel for num_threads(4) schedule(static)
-            for (int jj = 0; jj < cur_m_block_size; ++jj) {
-                const int cur_j          = j + jj;
-                ggml_fp16_t* B_col = weight_start + cur_j * K + k;
-
-                if (jj + 1 < cur_m_block_size)
-                    __builtin_prefetch(weight_start + (cur_j + 1) * K + k, 0, 1);
-
-                for (int ii = 0; ii < cur_n_block_size; ++ii) {
-                    const int cur_i          = i + ii;
-                    ggml_fp16_t* A_row = input_start + cur_i * K + k;
-
-                    if (ii + 1 < cur_n_block_size) {
-                        __builtin_prefetch(input_start + (cur_i + 1) * K + k, 0, 1);
-                        __builtin_prefetch(&local_dst[(cur_i + 1) * M + cur_j], 1, 1);
-                    }
-
-                    float dot = 0.0f;
-                    uint64_t element_num = (K - k) < BLOCK_SHARED_FP16 ? (K - k) : BLOCK_SHARED_FP16;
-                    ggml_vec_dot_f16(element_num, &dot, 0, A_row, 0, B_col, 0, 1);
-                    local_dst[cur_i * M + cur_j] += dot; // 完全无锁
-                }
-            }
-            auto e_time = ggml_time_us();
-
-        }
-    };
-
-    std::vector<float> cpu_local_dst(N * M, 0.0f);
-    std::thread t_npu(npu_worker);
-    std::thread t_cpu([&]() { cpu_worker(cpu_local_dst); });
-
-    t_npu.join();
-    t_cpu.join();
-    auto thread_end_time = ggml_time_us();
-    std::cout << "Total thread execution time: " << (thread_end_time - submit_time) / 1000.0 << " ms" << std::endl;
-
-    int total = N * M;
-    int idx = 0;
-
-    for (; idx + 4 <= total; idx += 4) {
-        float32x4_t g = vld1q_f32(&dst_data[idx]);
-        float32x4_t l = vld1q_f32(&cpu_local_dst[idx]);
-        vst1q_f32(&dst_data[idx], vaddq_f32(g, l));
-    }
-    auto final_merge_time = ggml_time_us();
-    std::cout << "Final merge time: " << (final_merge_time - thread_end_time) / 1000.0 << " ms" << std::endl;
-    std::cout << "Total NPU wait time: " << npu_wait_time / 1000.0 << " ms" << std::endl;
-    std::cout << "Total NPU+CPU time: " << npu_cpu_time / 1000.0 << " ms" << std::endl;
-    std::cout << "Total CPU time: " << cpu_time / 1000.0 << " ms" << std::endl;
-    npu_tasks_shared_fp16.reset();
+    std::cout << "Tasks submit(inline pipeline): " << task_count << std::endl;
+    std::cout << "Total inline pipeline time: " << (convert_e_time - convert_s_time) / 1000.0 << " ms" << std::endl;
+    std::cout << "Total layout time: " << layout_time / 1000.0 << " ms" << std::endl;
+    std::cout << "Total NPU submit+run time: " << npu_time / 1000.0 << " ms" << std::endl;
+    std::cout << "Total CPU consume time: " << cpu_time / 1000.0 << " ms" << std::endl;
 }
 
 
@@ -3025,16 +3106,16 @@ void ggml_compute_forward_mul_mat_npu(
     int domain_id = weight_domain ? weight_domain->id : get_default_domain_id();
     auto start_time = std::chrono::high_resolution_clock::now();
     try {
-        // if(type == GGML_TYPE_Q8_0_512) {
-        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
-        //     input_type.store(1, std::memory_order_release);
-        //     compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
-        // }else{
-        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
-        //     input_type.store(0, std::memory_order_release);
+        if(type == GGML_TYPE_Q8_0_512) {
+            std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
+            input_type.store(1, std::memory_order_release);
+            compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
+        }else{
+            std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
+            input_type.store(0, std::memory_order_release);
             // compute_matmul_fp16_parallel(src0, src1, dst, domain_id);
             compute_matmul_fp16_parallel_dynamic(src0, src1, dst, domain_id);
-        // }
+        }
         // std::cout << "Processing..." << std::flush;         // 不换行仅刷新
         // std::exit(0);
     } catch (const std::exception& e) {
