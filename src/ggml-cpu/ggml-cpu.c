@@ -2271,6 +2271,7 @@ static void ggml_compute_forward_mul_mat_id(
 /////////////////////////////////
 
 uint64_t total_time = 0.0;
+uint64_t total_matmul_time = 0.0;
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2683,8 +2684,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     const uint64_t t_end = ggml_time_us();
     if(tensor->op != GGML_OP_MUL_MAT) {
         total_time += (t_end - t_start);
+    }else{
+        total_matmul_time += (t_end - t_start);
     }
     printf("total time: %f seconds\n", total_time / 1e6);
+    printf("total matmul time: %f seconds\n", total_matmul_time / 1e6);
 }
 
 // Android's libc implementation "bionic" does not support setting affinity
