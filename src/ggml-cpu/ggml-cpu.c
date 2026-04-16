@@ -1430,81 +1430,81 @@ void ggml_compute_forward_mul_mat(
                     printf("\n");
                 }
                 
-                char in_filename[64];
-                snprintf(in_filename, sizeof(in_filename), "inputs/%d.txt", op_num);
-                FILE *f_in = fopen(in_filename, "w");
+                // char in_filename[64];
+                // snprintf(in_filename, sizeof(in_filename), "inputs/%d.txt", op_num);
+                // FILE *f_in = fopen(in_filename, "w");
 
-                if (f_in) {
-                    size_t in_elements = ggml_nelements(src1);
-                    if (src1->type == GGML_TYPE_F32) {
-                        float* in_ptr = (float*)src1->data;
-                        for (size_t i = 0; i < in_elements; i++) {
-                            fprintf(f_in, "%a\n", in_ptr[i]);
-                        }
-                    } 
-                    else if (src1->type == GGML_TYPE_F16) {
-                        const ggml_fp16_t* in_ptr = (const ggml_fp16_t*)src1->data;
-                        for (size_t i = 0; i < in_elements; i++) {
-                            fprintf(f_in, "%a\n", ggml_fp16_to_fp32(in_ptr[i]));
-                        }
-                    } 
-                    else {
-                        fprintf(f_in, "Unsupported type: %s\n", ggml_type_name(src1->type));
-                    }
-                    fclose(f_in);
-                    printf("  [SAVE] Input (src1) %zu elements saved to %s\n", in_elements, in_filename);
-                } else {
-                    printf("  [ERROR] Failed to open %s. Make sure 'inputs' folder exists.\n", in_filename);
-                }
+                // if (f_in) {
+                //     size_t in_elements = ggml_nelements(src1);
+                //     if (src1->type == GGML_TYPE_F32) {
+                //         float* in_ptr = (float*)src1->data;
+                //         for (size_t i = 0; i < in_elements; i++) {
+                //             fprintf(f_in, "%a\n", in_ptr[i]);
+                //         }
+                //     } 
+                //     else if (src1->type == GGML_TYPE_F16) {
+                //         const ggml_fp16_t* in_ptr = (const ggml_fp16_t*)src1->data;
+                //         for (size_t i = 0; i < in_elements; i++) {
+                //             fprintf(f_in, "%a\n", ggml_fp16_to_fp32(in_ptr[i]));
+                //         }
+                //     } 
+                //     else {
+                //         fprintf(f_in, "Unsupported type: %s\n", ggml_type_name(src1->type));
+                //     }
+                //     fclose(f_in);
+                //     printf("  [SAVE] Input (src1) %zu elements saved to %s\n", in_elements, in_filename);
+                // } else {
+                //     printf("  [ERROR] Failed to open %s. Make sure 'inputs' folder exists.\n", in_filename);
+                // }
 
 
-                char weight_filename[64];
-                snprintf(weight_filename, sizeof(weight_filename), "weights/%d.txt", op_num);
-                FILE *f_w = fopen(weight_filename, "w");
+                // char weight_filename[64];
+                // snprintf(weight_filename, sizeof(weight_filename), "weights/%d.txt", op_num);
+                // FILE *f_w = fopen(weight_filename, "w");
 
-                if (f_w) {
-                    printf("[CPU OP #%d] src0 Weight (type=%s, bytes=%zu)\n", 
-                        op_num, ggml_type_name(src0->type), ggml_nbytes(src0));
+                // if (f_w) {
+                //     printf("[CPU OP #%d] src0 Weight (type=%s, bytes=%zu)\n", 
+                //         op_num, ggml_type_name(src0->type), ggml_nbytes(src0));
 
-                    size_t total_bytes = ggml_nbytes(src0);
-                    uint8_t* data_ptr = (uint8_t*)src0->data;
+                //     size_t total_bytes = ggml_nbytes(src0);
+                //     uint8_t* data_ptr = (uint8_t*)src0->data;
 
-                    if (src0->type == GGML_TYPE_F32) {
-                        // F32 打印为浮点数
-                        float* f32_ptr = (float*)data_ptr;
-                        size_t n_elements = ggml_nelements(src0);
-                        for (size_t i = 0; i < n_elements; i++) {
-                            fprintf(f_w, "%a\n", f32_ptr[i]);
-                        }
-                    } 
-                    else if (src0->type == GGML_TYPE_F16) {
-                        // F16 转换后打印为浮点数
-                        const ggml_fp16_t* f16_ptr = (const ggml_fp16_t*)data_ptr;
-                        size_t n_elements = ggml_nelements(src0);
-                        for (size_t i = 0; i < n_elements; i++) {
-                            fprintf(f_w, "%a\n", ggml_fp16_to_fp32(f16_ptr[i]));
-                        }
-                    } 
-                    else {
-                        // 对于 Q8_0, Q4_0 等量化类型，直接打印原始十六进制字节
-                        // 这样可以确保即使不了解 block 结构也能进行逐字节对比
-                        for (size_t i = 0; i < total_bytes; i++) {
-                            fprintf(f_w, "%02x\n", data_ptr[i]);
+                //     if (src0->type == GGML_TYPE_F32) {
+                //         // F32 打印为浮点数
+                //         float* f32_ptr = (float*)data_ptr;
+                //         size_t n_elements = ggml_nelements(src0);
+                //         for (size_t i = 0; i < n_elements; i++) {
+                //             fprintf(f_w, "%a\n", f32_ptr[i]);
+                //         }
+                //     } 
+                //     else if (src0->type == GGML_TYPE_F16) {
+                //         // F16 转换后打印为浮点数
+                //         const ggml_fp16_t* f16_ptr = (const ggml_fp16_t*)data_ptr;
+                //         size_t n_elements = ggml_nelements(src0);
+                //         for (size_t i = 0; i < n_elements; i++) {
+                //             fprintf(f_w, "%a\n", ggml_fp16_to_fp32(f16_ptr[i]));
+                //         }
+                //     } 
+                //     else {
+                //         // 对于 Q8_0, Q4_0 等量化类型，直接打印原始十六进制字节
+                //         // 这样可以确保即使不了解 block 结构也能进行逐字节对比
+                //         for (size_t i = 0; i < total_bytes; i++) {
+                //             fprintf(f_w, "%02x\n", data_ptr[i]);
                             
-                            // 屏幕控制台只打印前 64 字节预览，避免刷屏
-                            if (i < 64) {
-                                printf("%02x ", data_ptr[i]);
-                                if ((i + 1) % 16 == 0) printf("\n  ");
-                            }
-                        }
-                        printf(total_bytes > 64 ? "...\n" : "\n");
-                    }
+                //             // 屏幕控制台只打印前 64 字节预览，避免刷屏
+                //             if (i < 64) {
+                //                 printf("%02x ", data_ptr[i]);
+                //                 if ((i + 1) % 16 == 0) printf("\n  ");
+                //             }
+                //         }
+                //         printf(total_bytes > 64 ? "...\n" : "\n");
+                //     }
 
-                    fclose(f_w);
-                    printf("  [SAVE] Weight %zu bytes saved to %s\n", total_bytes, weight_filename);
-                } else {
-                    printf("  [ERROR] Failed to open %s. Make sure 'weights' folder exists.\n", weight_filename);
-                }
+                //     fclose(f_w);
+                //     printf("  [SAVE] Weight %zu bytes saved to %s\n", total_bytes, weight_filename);
+                // } else {
+                //     printf("  [ERROR] Failed to open %s. Make sure 'weights' folder exists.\n", weight_filename);
+                // }
 
                 ggml_compute_forward_mul_mat_npu(params, dst);
                 
@@ -1927,80 +1927,80 @@ UseGgmlGemm2:;
                     op_num, filename);
         }
 
-        char in_filename[64];
-        snprintf(in_filename, sizeof(in_filename), "inputs/%d.txt", op_num);
-        FILE *f_in = fopen(in_filename, "w");
+        // char in_filename[64];
+        // snprintf(in_filename, sizeof(in_filename), "inputs/%d.txt", op_num);
+        // FILE *f_in = fopen(in_filename, "w");
 
-        if (f_in) {
-            size_t in_elements = ggml_nelements(src1);
-            if (src1->type == GGML_TYPE_F32) {
-                float* in_ptr = (float*)src1->data;
-                for (size_t i = 0; i < in_elements; i++) {
-                    fprintf(f_in, "%a\n", in_ptr[i]);
-                }
-            } 
-            else if (src1->type == GGML_TYPE_F16) {
-                const ggml_fp16_t* in_ptr = (const ggml_fp16_t*)src1->data;
-                for (size_t i = 0; i < in_elements; i++) {
-                    fprintf(f_in, "%a\n", ggml_fp16_to_fp32(in_ptr[i]));
-                }
-            } 
-            else {
-                fprintf(f_in, "Unsupported type: %s\n", ggml_type_name(src1->type));
-            }
-            fclose(f_in);
-            printf("  [SAVE] Input (src1) %zu elements saved to %s\n", in_elements, in_filename);
-        } else {
-            printf("  [ERROR] Failed to open %s. Make sure 'inputs' folder exists.\n", in_filename);
-        }
+        // if (f_in) {
+        //     size_t in_elements = ggml_nelements(src1);
+        //     if (src1->type == GGML_TYPE_F32) {
+        //         float* in_ptr = (float*)src1->data;
+        //         for (size_t i = 0; i < in_elements; i++) {
+        //             fprintf(f_in, "%a\n", in_ptr[i]);
+        //         }
+        //     } 
+        //     else if (src1->type == GGML_TYPE_F16) {
+        //         const ggml_fp16_t* in_ptr = (const ggml_fp16_t*)src1->data;
+        //         for (size_t i = 0; i < in_elements; i++) {
+        //             fprintf(f_in, "%a\n", ggml_fp16_to_fp32(in_ptr[i]));
+        //         }
+        //     } 
+        //     else {
+        //         fprintf(f_in, "Unsupported type: %s\n", ggml_type_name(src1->type));
+        //     }
+        //     fclose(f_in);
+        //     printf("  [SAVE] Input (src1) %zu elements saved to %s\n", in_elements, in_filename);
+        // } else {
+        //     printf("  [ERROR] Failed to open %s. Make sure 'inputs' folder exists.\n", in_filename);
+        // }
 
-        char weight_filename[64];
-        snprintf(weight_filename, sizeof(weight_filename), "weights/%d.txt", op_num);
-        FILE *f_w = fopen(weight_filename, "w");
+        // char weight_filename[64];
+        // snprintf(weight_filename, sizeof(weight_filename), "weights/%d.txt", op_num);
+        // FILE *f_w = fopen(weight_filename, "w");
 
-        if (f_w) {
-            printf("[CPU OP #%d] src0 Weight (type=%s, bytes=%zu)\n", 
-                op_num, ggml_type_name(src0->type), ggml_nbytes(src0));
+        // if (f_w) {
+        //     printf("[CPU OP #%d] src0 Weight (type=%s, bytes=%zu)\n", 
+        //         op_num, ggml_type_name(src0->type), ggml_nbytes(src0));
 
-            size_t total_bytes = ggml_nbytes(src0);
-            uint8_t* data_ptr = (uint8_t*)src0->data;
+        //     size_t total_bytes = ggml_nbytes(src0);
+        //     uint8_t* data_ptr = (uint8_t*)src0->data;
 
-            if (src0->type == GGML_TYPE_F32) {
-                // F32 打印为浮点数
-                float* f32_ptr = (float*)data_ptr;
-                size_t n_elements = ggml_nelements(src0);
-                for (size_t i = 0; i < n_elements; i++) {
-                    fprintf(f_w, "%a\n", f32_ptr[i]);
-                }
-            } 
-            else if (src0->type == GGML_TYPE_F16) {
-                // F16 转换后打印为浮点数
-                const ggml_fp16_t* f16_ptr = (const ggml_fp16_t*)data_ptr;
-                size_t n_elements = ggml_nelements(src0);
-                for (size_t i = 0; i < n_elements; i++) {
-                    fprintf(f_w, "%a\n", ggml_fp16_to_fp32(f16_ptr[i]));
-                }
-            } 
-            else {
-                // 对于 Q8_0, Q4_0 等量化类型，直接打印原始十六进制字节
-                // 这样可以确保即使不了解 block 结构也能进行逐字节对比
-                for (size_t i = 0; i < total_bytes; i++) {
-                    fprintf(f_w, "%02x\n", data_ptr[i]);
+        //     if (src0->type == GGML_TYPE_F32) {
+        //         // F32 打印为浮点数
+        //         float* f32_ptr = (float*)data_ptr;
+        //         size_t n_elements = ggml_nelements(src0);
+        //         for (size_t i = 0; i < n_elements; i++) {
+        //             fprintf(f_w, "%a\n", f32_ptr[i]);
+        //         }
+        //     } 
+        //     else if (src0->type == GGML_TYPE_F16) {
+        //         // F16 转换后打印为浮点数
+        //         const ggml_fp16_t* f16_ptr = (const ggml_fp16_t*)data_ptr;
+        //         size_t n_elements = ggml_nelements(src0);
+        //         for (size_t i = 0; i < n_elements; i++) {
+        //             fprintf(f_w, "%a\n", ggml_fp16_to_fp32(f16_ptr[i]));
+        //         }
+        //     } 
+        //     else {
+        //         // 对于 Q8_0, Q4_0 等量化类型，直接打印原始十六进制字节
+        //         // 这样可以确保即使不了解 block 结构也能进行逐字节对比
+        //         for (size_t i = 0; i < total_bytes; i++) {
+        //             fprintf(f_w, "%02x\n", data_ptr[i]);
                     
-                    // 屏幕控制台只打印前 64 字节预览，避免刷屏
-                    if (i < 64) {
-                        printf("%02x ", data_ptr[i]);
-                        if ((i + 1) % 16 == 0) printf("\n  ");
-                    }
-                }
-                printf(total_bytes > 64 ? "...\n" : "\n");
-            }
+        //             // 屏幕控制台只打印前 64 字节预览，避免刷屏
+        //             if (i < 64) {
+        //                 printf("%02x ", data_ptr[i]);
+        //                 if ((i + 1) % 16 == 0) printf("\n  ");
+        //             }
+        //         }
+        //         printf(total_bytes > 64 ? "...\n" : "\n");
+        //     }
 
-            fclose(f_w);
-            printf("  [SAVE] Weight %zu bytes saved to %s\n", total_bytes, weight_filename);
-        } else {
-            printf("  [ERROR] Failed to open %s. Make sure 'weights' folder exists.\n", weight_filename);
-        }
+        //     fclose(f_w);
+        //     printf("  [SAVE] Weight %zu bytes saved to %s\n", total_bytes, weight_filename);
+        // } else {
+        //     printf("  [ERROR] Failed to open %s. Make sure 'weights' folder exists.\n", weight_filename);
+        // }
         // 4. 保持原来的控制台预览打印（前 64 个）
         printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
         float* result_ptr = (float*)dst->data;
@@ -2270,6 +2270,7 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+uint64_t total_time = 0.0;
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2281,7 +2282,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
-
+    const uint64_t t_start = ggml_time_us();
     switch (tensor->op) {
         case GGML_OP_DUP:
             {
@@ -2679,6 +2680,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("fatal error");
             }
     }
+    const uint64_t t_end = ggml_time_us();
+    if(tensor->op != GGML_OP_MUL_MAT) {
+        total_time += (t_end - t_start);
+    }
+    printf("total time: %f seconds\n", total_time / 1e6);
 }
 
 // Android's libc implementation "bionic" does not support setting affinity
