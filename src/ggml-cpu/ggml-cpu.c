@@ -2270,8 +2270,8 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
-uint64_t total_time = 0.0;
-uint64_t total_matmul_time = 0.0;
+uint64_t total_time = 0;
+uint64_t total_matmul_time = 0;
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2283,7 +2283,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
-    const uint64_t t_start = ggml_time_us();
+    ggml_barrier(params->threadpool);
+    uint64_t t_start = 0;
+    if (params->ith == 0) {
+        t_start = ggml_time_us();
+    }
     switch (tensor->op) {
         case GGML_OP_DUP:
             {
@@ -2681,14 +2685,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("fatal error");
             }
     }
-    const uint64_t t_end = ggml_time_us();
-    if(tensor->op != GGML_OP_MUL_MAT) {
-        total_time += (t_end - t_start);
-    }else{
-        total_matmul_time += (t_end - t_start);
+    ggml_barrier(params->threadpool);
+    if (params->ith == 0) {
+        const uint64_t t_end = ggml_time_us();
+        const uint64_t dt = t_end - t_start;
+        
+        if (tensor->op == GGML_OP_MUL_MAT) {
+            total_matmul_time += dt;
+        }else{
+            total_time += dt;
+        }
+        printf("total time: %f seconds\n", total_time / 1e6);
+        printf("total matmul time: %f seconds\n", total_matmul_time / 1e6);
     }
-    printf("total time: %f seconds\n", total_time / 1e6);
-    printf("total matmul time: %f seconds\n", total_matmul_time / 1e6);
 }
 
 // Android's libc implementation "bionic" does not support setting affinity
