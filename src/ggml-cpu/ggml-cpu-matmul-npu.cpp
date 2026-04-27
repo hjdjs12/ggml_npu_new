@@ -14,6 +14,7 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -105,6 +106,90 @@ inline uint16_t float_to_half(float f) {
     return res;
 }
 
+static inline float absmax_f32_fast(const float * x, int n) {
+#ifdef __ARM_NEON
+    int i = 0;
+    float32x4_t vmax = vdupq_n_f32(0.0f);
+    for (; i + 16 <= n; i += 16) {
+        const float32x4_t v0 = vabsq_f32(vld1q_f32(x + i + 0));
+        const float32x4_t v1 = vabsq_f32(vld1q_f32(x + i + 4));
+        const float32x4_t v2 = vabsq_f32(vld1q_f32(x + i + 8));
+        const float32x4_t v3 = vabsq_f32(vld1q_f32(x + i + 12));
+        vmax = vmaxq_f32(vmax, v0);
+        vmax = vmaxq_f32(vmax, v1);
+        vmax = vmaxq_f32(vmax, v2);
+        vmax = vmaxq_f32(vmax, v3);
+    }
+    float vmax_arr[4];
+    vst1q_f32(vmax_arr, vmax);
+    float amax = std::max(std::max(vmax_arr[0], vmax_arr[1]), std::max(vmax_arr[2], vmax_arr[3]));
+    for (; i < n; ++i) {
+        amax = std::max(amax, std::abs(x[i]));
+    }
+    return amax;
+#else
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        amax = std::max(amax, std::abs(x[i]));
+    }
+    return amax;
+#endif
+}
+
+static inline void quantize_row_q8_neon_fast(const float * x, int n, const float id, int8_t * out) {
+#ifdef __ARM_NEON
+    const float32x4_t v_zero = vdupq_n_f32(0.0f);
+    const float32x4_t v_half = vdupq_n_f32(0.5f);
+    const float32x4_t v_nhalf = vdupq_n_f32(-0.5f);
+    const int32x4_t v_min = vdupq_n_s32(-128);
+    const int32x4_t v_max = vdupq_n_s32(127);
+
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const float32x4_t v0 = vmulq_n_f32(vld1q_f32(x + i + 0), id);
+        const float32x4_t v1 = vmulq_n_f32(vld1q_f32(x + i + 4), id);
+        const float32x4_t v2 = vmulq_n_f32(vld1q_f32(x + i + 8), id);
+        const float32x4_t v3 = vmulq_n_f32(vld1q_f32(x + i + 12), id);
+
+        const float32x4_t b0 = vbslq_f32(vcgeq_f32(v0, v_zero), v_half, v_nhalf);
+        const float32x4_t b1 = vbslq_f32(vcgeq_f32(v1, v_zero), v_half, v_nhalf);
+        const float32x4_t b2 = vbslq_f32(vcgeq_f32(v2, v_zero), v_half, v_nhalf);
+        const float32x4_t b3 = vbslq_f32(vcgeq_f32(v3, v_zero), v_half, v_nhalf);
+
+        int32x4_t q0 = vcvtq_s32_f32(vaddq_f32(v0, b0));
+        int32x4_t q1 = vcvtq_s32_f32(vaddq_f32(v1, b1));
+        int32x4_t q2 = vcvtq_s32_f32(vaddq_f32(v2, b2));
+        int32x4_t q3 = vcvtq_s32_f32(vaddq_f32(v3, b3));
+
+        q0 = vminq_s32(vmaxq_s32(q0, v_min), v_max);
+        q1 = vminq_s32(vmaxq_s32(q1, v_min), v_max);
+        q2 = vminq_s32(vmaxq_s32(q2, v_min), v_max);
+        q3 = vminq_s32(vmaxq_s32(q3, v_min), v_max);
+
+        const int16x4_t q16_0 = vqmovn_s32(q0);
+        const int16x4_t q16_1 = vqmovn_s32(q1);
+        const int16x4_t q16_2 = vqmovn_s32(q2);
+        const int16x4_t q16_3 = vqmovn_s32(q3);
+        const int16x8_t q16_lo = vcombine_s16(q16_0, q16_1);
+        const int16x8_t q16_hi = vcombine_s16(q16_2, q16_3);
+        const int8x16_t q8 = vcombine_s8(vqmovn_s16(q16_lo), vqmovn_s16(q16_hi));
+        vst1q_s8(out + i, q8);
+    }
+
+    for (; i < n; ++i) {
+        int q = (int) std::lround(x[i] * id);
+        q = std::max(-128, std::min(127, q));
+        out[i] = (int8_t) q;
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        int q = (int) std::lround(x[i] * id);
+        q = std::max(-128, std::min(127, q));
+        out[i] = (int8_t) q;
+    }
+#endif
+}
+
 template <int NEW_G>
 void convert_q8_to_large_block(
     const block_q8_0* src,
@@ -147,21 +232,19 @@ void quantize_row_q8_0_custom(const float* src, block_q8_0_x<N>* dst, int64_t n)
     const int num_blocks = n / N;
 
     for (int i = 0; i < num_blocks; ++i) {
-        float amax = 0.0f;
         const float* x = src + i * N;
-
-        for (int j = 0; j < N; ++j) {
-            amax = std::max(amax, std::abs(x[j]));
-        }
+        const float amax = absmax_f32_fast(x, N);
 
         const float d = amax / 127.0f;
         dst[i].d = float_to_half(d);
         const float id = d > 0.0f ? 1.0f / d : 0.0f;
 
-        for (int j = 0; j < N; ++j) {
-            int rounded = (int)std::lround(x[j] * id);
-            dst[i].qs[j] = (int8_t)std::max(-128, std::min(127, rounded));
+        if (id == 0.0f) {
+            std::memset(dst[i].qs, 0, (size_t) N);
+            continue;
         }
+
+        quantize_row_q8_neon_fast(x, N, id, dst[i].qs);
     }
 }
 
@@ -1681,6 +1764,463 @@ int get_optimized_n_M(int M) {
     return 0; // 如果找不到能被 16 整除的约数（例如 M < 16 时）
 }
 
+// static void compute_matmul_fp16_parallel_dynamic(
+//     const struct ggml_tensor* src0,  // weight (M x K, Q8_0, pre-quantized with IOMMU)
+//     const struct ggml_tensor* src1,  // input (N x K, FP32)
+//     struct ggml_tensor* dst,         // output (N x M, FP32)
+//     int domain_id) {
+    
+
+//     // const int M = 8960;  // weight rows (output dimension when transposed)
+//     // const int K = 1536;  // weight cols = input cols (shared dimension)
+//     // const int N = 2400;  // input rows (batch size)
+//     // TASKS_LOCAL_PER_NUM = 1; // debug: force single-task submit to isolate core2/slot2 issues
+//     // BLOCK_N_FP16 = N > 348 ? get_optimized_n_N(N) : 348;
+//     // BLOCK_SHARED_FP16 = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
+//     // BLOCK_WEIGHT_FP16 = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
+//     // std::vector<ggml_fp16_t> weight_f16(M * K);
+
+//     // // 从 .txt 按行读取，每行一个元素（支持 %a 十六进制浮点）
+//     // {
+//     //     std::ifstream f_w("/mnt/nvme/stable-diffusion-new2.cpp/weights/547.txt");
+//     //     if (!f_w.is_open()) {
+//     //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/weights/547.txt\n");
+//     //     } else {
+//     //         std::string line;
+//     //         size_t count = 0;
+//     //         while (count < (size_t) M * K && std::getline(f_w, line)) {
+//     //             char * end = nullptr;
+//     //             float v = std::strtof(line.c_str(), &end);
+//     //             if (end == line.c_str()) {
+//     //                 continue;
+//     //             }
+//     //             weight_f16[count++] = ggml_fp32_to_fp16(v);
+//     //         }
+//     //         printf(">>> Loaded weight: %zu / %d elements\n", count, M * K);
+//     //     }
+//     // }
+
+//     // // --- 2. 加载 Input (src1) ---
+//     // // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
+//     // std::vector<ggml_fp16_t> input_fp16(N * K);
+//     // std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
+
+//     // {
+//     //     std::ifstream f_i("/mnt/nvme/stable-diffusion-new2.cpp/inputs/547.txt");
+//     //     if (!f_i.is_open()) {
+//     //         printf(">>> Error: Could not open /mnt/nvme/stable-diffusion-new2.cpp/inputs/547.txt\n");
+//     //     } else {
+//     //         std::string line;
+//     //         size_t count = 0;
+//     //         while (count < (size_t) N * K && std::getline(f_i, line)) {
+//     //             char * end = nullptr;
+//     //             float v = std::strtof(line.c_str(), &end);
+//     //             if (end == line.c_str()) {
+//     //                 continue;
+//     //             }
+//     //             input_fp32[count++] = v;
+//     //         }
+//     //         printf(">>> Loaded input: %zu / %d elements\n", count, N * K);
+//     //     }
+//     // }
+//     // // if(src1->type == GGML_TYPE_F16){
+//     // //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+//     // // }else{
+//     // ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
+//     // // }
+//     // // --- 1. 打印 Weight (src0) 前 10 个元素 ---
+//     // if (!weight_f16.empty()) {
+//     //     printf(">>> Weight (src0) first 10 elements:\n  ");
+//     //     for (int i = 0; i < 10 && i < (M * K); i++) {
+//     //         // 转换并打印
+//     //         float val = ggml_fp16_to_fp32(weight_f16[i]);
+//     //         printf("[%d]: %.6f (0x%04X)  ", i, val, weight_f16[i]);
+//     //         if ((i + 1) % 5 == 0) printf("\n  ");
+//     //     }
+//     //     printf("\n");
+//     // }
+
+//     // // --- 2. 打印 Input (src1) 前 10 个元素 ---
+//     // if (!input_fp16.empty()) {
+//     //     printf(">>> Input (src1) first 10 elements:\n  ");
+//     //     for (int i = 0; i < 10 && i < (N * K); i++) {
+//     //         // 转换并打印
+//     //         float val = ggml_fp16_to_fp32(input_fp16[i]);
+//     //         printf("[%d]: %.6f (0x%04X)  ", i, val, input_fp16[i]);
+//     //         if ((i + 1) % 5 == 0) printf("\n  ");
+//     //     }
+//     //     printf("\n");
+//     // }
+
+
+
+
+//     TASKS_LOCAL_PER_NUM = 1;
+//     const int M = src0->ne[1];  // weight rows (output dimension when transposed)
+//     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
+//     const int N = src1->ne[1];  // input rows (batch size)
+//     BLOCK_N_FP16 = N > 348 ? get_optimized_n_N(N) : 348;
+//     BLOCK_SHARED_FP16 = (K % 512 == 0 || K < 512) ? 512 : get_optimized_n_K(K); // M 的块大小，保持不变
+//     BLOCK_WEIGHT_FP16 = (M % 2048 == 0 || M < 2048) ? 2048 : get_optimized_n_M(M); // M 的块大小，保持不变
+//     if (src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F32) {
+//         fprintf(stderr, "[NPU] Error: Input tensor should be FP16/FP32, got type %d\n", src1->type);
+//         throw std::runtime_error("Input tensor type not supported");
+//     }
+
+//     if (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F32) {
+//         fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to FP16, got type %d\n", src0->type);
+//         throw std::runtime_error("Weight tensor not pre-quantized");
+//     }
+
+//     const ggml_fp16_t * src1_f16 = src1->type == GGML_TYPE_F16 ? (const ggml_fp16_t *) src1->data : nullptr;
+//     const float * src1_f32 = src1->type == GGML_TYPE_F32 ? (const float *) src1->data : nullptr;
+//     const ggml_fp16_t * src0_f16 = src0->type == GGML_TYPE_F16 ? (const ggml_fp16_t *) src0->data : nullptr;
+//     const uint16_t * src0_bf16 = src0->type == GGML_TYPE_BF16 ? (const uint16_t *) src0->data : nullptr;
+//     const float * src0_f32 = src0->type == GGML_TYPE_F32 ? (const float *) src0->data : nullptr;
+    
+//     auto convert_s_time = ggml_time_us();
+//     std::cout << "Data preparation time (including conversion): " << (convert_s_time - convert_s_time) / 1000.0 << " ms" << std::endl;
+//     Domain* domain = get_global_domain0();
+//     if (!domain || !domain->input || !domain->weight) {
+//         fprintf(stderr, "[NPU] ERROR: Global domain0/input/weight not initialized\n");
+//         throw std::runtime_error("Global domain0 buffers not initialized");
+//     }
+
+//     float * dst_data = (float *) dst->data;
+//     std::fill(dst_data, dst_data + N * M, 0.0f);
+
+//     uint64_t layout_time = 0;
+//     uint64_t npu_time = 0;
+//     uint64_t cpu_time = 0;
+//     int task_count = 0;
+
+//     auto consume_fp16_output = [&](int i, int j, int current_n_task, int current_m_task, float * task_output) {
+//         invalid_cache(task_output, (uint64_t) current_n_task * align_up4(current_m_task) * sizeof(float));
+
+//     #pragma omp parallel for num_threads(4)
+//         for (int joff = 0; joff < current_m_task; joff += 4) {
+//             const int cur_M_base = j + joff;
+//             const int lanes = std::min(4, current_m_task - joff);
+//             int feature_offset = feature_data(current_n_task, 4, joff, 0);
+
+//             for (int ioff = 0; ioff < current_n_task; ioff++) {
+//                 if (ioff + LOOKAHEAD < current_n_task) {
+//                     __builtin_prefetch(
+//                         &dst_data[(ioff + i + LOOKAHEAD) * M + cur_M_base],
+//                         1,
+//                         1);
+//                     if ((ioff % 4) == 0) {
+//                         __builtin_prefetch(
+//                             &task_output[feature_offset + LOOKAHEAD * 4],
+//                             0,
+//                             1);
+//                     }
+//                 }
+
+//                 if (lanes == 4) {
+//                     float32x4_t v_val = vld1q_f32(&task_output[feature_offset]);
+//                     float * out_ptr = &dst_data[(ioff + i) * M + cur_M_base];
+//                     float32x4_t out_old = vld1q_f32(out_ptr);
+//                     out_old = vaddq_f32(out_old, v_val);
+//                     vst1q_f32(out_ptr, out_old);
+//                 } else {
+//                     for (int lane = 0; lane < lanes; lane++) {
+//                         dst_data[(ioff + i) * M + cur_M_base + lane] += task_output[feature_offset + lane];
+//                     }
+//                 }
+
+//                 feature_offset += 4;
+//             }
+//         }
+//     };
+
+//     struct prepared_task_t {
+//         int i;
+//         int j;
+//         int k;
+//         int n_i;
+//         int n;
+//         int k_blk;
+//         int w_id;
+//         size_t input_bytes;
+//         size_t weight_bytes;
+//         std::shared_ptr<std::vector<ggml_fp16_t>> input_layout;
+//         std::shared_ptr<std::vector<ggml_fp16_t>> weight_layout;
+//     };
+
+//     struct npu_done_task_t {
+//         int i;
+//         int j;
+//         int k;
+//         int n_i;
+//         int n;
+//         int slot;
+//         float * output;
+//     };
+
+//     const int max_k_in_blk = (BLOCK_SHARED_FP16 + 15) & ~15;
+//     const int max_k_w_blk = (BLOCK_SHARED_FP16 + 31) & ~31;
+//     const size_t max_input_bytes = (size_t) BLOCK_N_FP16 * max_k_in_blk * sizeof(ggml_fp16_t);
+//     const size_t max_weight_bytes = (size_t) BLOCK_WEIGHT_FP16 * max_k_w_blk * sizeof(ggml_fp16_t);
+//     if (max_input_bytes > domain->input->size) {
+//         fprintf(stderr, "[NPU] ERROR: max input block %zu exceeds input buffer %zu\n", max_input_bytes, domain->input->size);
+//         throw std::runtime_error("Input block overflow");
+//     }
+//     if (max_weight_bytes > domain->weight->size) {
+//         fprintf(stderr, "[NPU] ERROR: max weight block %zu exceeds weight buffer %zu\n", max_weight_bytes, domain->weight->size);
+//         throw std::runtime_error("Weight block overflow");
+//     }
+
+//     constexpr int SLOT_COUNT = 4;
+//     const size_t output_stride = (size_t) BLOCK_N_FP16 * align_up4(BLOCK_WEIGHT_FP16);
+//     if (output_stride * SLOT_COUNT * sizeof(float) > domain->output->size) {
+//         fprintf(stderr, "[NPU] ERROR: output slots exceed output buffer\n");
+//         throw std::runtime_error("Output slot overflow");
+//     }
+
+//     g_fp16_output_stride_override.store(output_stride, std::memory_order_relaxed);
+
+//     std::deque<prepared_task_t> q_prepared;
+//     std::deque<npu_done_task_t> q_done;
+//     std::deque<int> q_free_slots;
+//     for (int s = 0; s < SLOT_COUNT; ++s) {
+//         q_free_slots.push_back(s);
+//     }
+
+//     std::mutex m_prepared;
+//     std::mutex m_done;
+//     std::mutex m_slots;
+//     std::mutex m_err;
+//     std::condition_variable cv_prepared;
+//     std::condition_variable cv_done;
+//     std::condition_variable cv_slots;
+//     std::atomic<bool> prep_done{false};
+//     std::atomic<bool> npu_done{false};
+//     std::atomic<bool> abort_pipeline{false};
+//     std::string err_msg;
+
+//     auto set_error = [&](const std::string & msg) {
+//         bool expected = false;
+//         if (abort_pipeline.compare_exchange_strong(expected, true)) {
+//             std::lock_guard<std::mutex> lk(m_err);
+//             err_msg = msg;
+//         }
+//         cv_prepared.notify_all();
+//         cv_done.notify_all();
+//         cv_slots.notify_all();
+//     };
+
+//     std::atomic<uint64_t> layout_time_acc{0};
+//     std::atomic<uint64_t> npu_time_acc{0};
+//     std::atomic<uint64_t> cpu_time_acc{0};
+//     std::atomic<int> task_count_acc{0};
+
+//     std::thread threadA([&]() {
+//         auto t0 = ggml_time_us();
+//         int w_id = 0;
+
+//         // True streaming producer:
+//         // generate one (j,k) weight block, then immediately generate/enqueue its (i, j, k) tasks.
+//         for (int j = 0; j < M && !abort_pipeline.load(std::memory_order_relaxed); j += BLOCK_WEIGHT_FP16) {
+//             const int _n = std::min(M - j, BLOCK_WEIGHT_FP16);
+
+//             for (int k = 0; k < K && !abort_pipeline.load(std::memory_order_relaxed); k += BLOCK_SHARED_FP16, ++w_id) {
+//                 const int _k = std::min(K - k, BLOCK_SHARED_FP16);
+//                 const int k_w_blk = (_k + 31) & ~31;
+//                 const size_t weight_bytes = (size_t) _n * k_w_blk * sizeof(ggml_fp16_t);
+//                 auto w_layout = std::make_shared<std::vector<ggml_fp16_t>>((size_t) _n * k_w_blk, (ggml_fp16_t) 0);
+
+//                 for (int joff = 0; joff < _n; ++joff) {
+//                     const int src_row = j + joff;
+//                     for (int koff = 0; koff < _k; ++koff) {
+//                         const int src_idx = src_row * K + (k + koff);
+//                         ggml_fp16_t v = 0;
+//                         if (src0_f16) {
+//                             v = src0_f16[src_idx];
+//                         } else if (src0_bf16) {
+//                             uint32_t f32_bits = (uint32_t) src0_bf16[src_idx] << 16;
+//                             float f32;
+//                             memcpy(&f32, &f32_bits, sizeof(float));
+//                             v = ggml_fp32_to_fp16(f32);
+//                         } else {
+//                             v = ggml_fp32_to_fp16(src0_f32[src_idx]);
+//                         }
+//                         const int target = weight_fp16(_k, joff, koff);
+//                         (*w_layout)[(size_t) target] = v;
+//                     }
+//                 }
+
+//                 const int k_in_blk = (_k + 15) & ~15;
+//                 for (int i = 0; i < N && !abort_pipeline.load(std::memory_order_relaxed); i += BLOCK_N_FP16) {
+//                     const int _n_i = std::min(N - i, BLOCK_N_FP16);
+//                     const size_t input_bytes = (size_t) _n_i * k_in_blk * sizeof(ggml_fp16_t);
+//                     auto input_layout = std::make_shared<std::vector<ggml_fp16_t>>((size_t) _n_i * k_in_blk, (ggml_fp16_t) 0);
+
+//                     for (int ioff = 0; ioff < _n_i; ++ioff) {
+//                         const int src_row = i + ioff;
+//                         for (int koff = 0; koff < _k; ++koff) {
+//                             const int src_idx = src_row * K + (k + koff);
+//                             const ggml_fp16_t v = src1_f16 ? src1_f16[src_idx] : ggml_fp32_to_fp16(src1_f32[src_idx]);
+//                             const int target = feature_data(_n_i, 8, koff, ioff);
+//                             (*input_layout)[(size_t) target] = v;
+//                         }
+//                     }
+
+//                     prepared_task_t task = {};
+//                     task.i = i;
+//                     task.j = j;
+//                     task.k = k;
+//                     task.n_i = _n_i;
+//                     task.n = _n;
+//                     task.k_blk = _k;
+//                     task.w_id = w_id;
+//                     task.input_bytes = input_bytes;
+//                     task.weight_bytes = weight_bytes;
+//                     task.input_layout = std::move(input_layout);
+//                     task.weight_layout = w_layout;
+
+//                     {
+//                         std::lock_guard<std::mutex> lk(m_prepared);
+//                         q_prepared.push_back(std::move(task));
+//                     }
+//                     cv_prepared.notify_one();
+//                 }
+//             }
+//         }
+//         auto t1 = ggml_time_us();
+//         layout_time_acc.fetch_add((uint64_t) (t1 - t0), std::memory_order_relaxed);
+//         prep_done.store(true, std::memory_order_release);
+//         cv_prepared.notify_all();
+//     });
+
+//     std::thread threadB([&]() {
+//         int last_w_id = -1;
+//         while (!abort_pipeline.load(std::memory_order_relaxed)) {
+//             prepared_task_t task = {};
+//             {
+//                 std::unique_lock<std::mutex> lk(m_prepared);
+//                 cv_prepared.wait(lk, [&]() {
+//                     return abort_pipeline.load(std::memory_order_relaxed) || !q_prepared.empty() || prep_done.load(std::memory_order_acquire);
+//                 });
+//                 if (abort_pipeline.load(std::memory_order_relaxed)) {
+//                     break;
+//                 }
+//                 if (q_prepared.empty()) {
+//                     break;
+//                 }
+//                 task = std::move(q_prepared.front());
+//                 q_prepared.pop_front();
+//             }
+
+//             int slot = 0;
+//             {
+//                 std::unique_lock<std::mutex> lk(m_slots);
+//                 cv_slots.wait(lk, [&]() {
+//                     return abort_pipeline.load(std::memory_order_relaxed) || !q_free_slots.empty();
+//                 });
+//                 if (abort_pipeline.load(std::memory_order_relaxed)) {
+//                     break;
+//                 }
+//                 slot = q_free_slots.front();
+//                 q_free_slots.pop_front();
+//             }
+
+//             if (last_w_id != task.w_id) {
+//                 memcpy(domain->weight->virtual_addr, task.weight_layout->data(), task.weight_bytes);
+//                 flush_cache(domain->weight->virtual_addr, task.weight_bytes);
+//                 last_w_id = task.w_id;
+//             }
+
+//             memcpy(domain->input->virtual_addr, task.input_layout->data(), task.input_bytes);
+//             flush_cache(domain->input->virtual_addr, task.input_bytes);
+
+//             rknpu_tasks_t one_task = {};
+//             one_task.tasks[0] = matmul_task_t{
+//                 domain->input->iommu_addr,
+//                 domain->weight->iommu_addr,
+//                 task.n_i,
+//                 task.k_blk,
+//                 task.n,
+//                 task.i,
+//             };
+
+//             auto npu_s = ggml_time_us();
+//             auto outq = rknpu_matmul_fp16(one_task, domain_id, slot);
+//             auto npu_e = ggml_time_us();
+//             npu_time_acc.fetch_add((uint64_t) (npu_e - npu_s), std::memory_order_relaxed);
+
+//             float * out_ptr = outq.output_fp16[0];
+//             if (out_ptr == nullptr) {
+//                 set_error("NPU returned null output");
+//                 break;
+//             }
+
+//             {
+//                 std::lock_guard<std::mutex> lk(m_done);
+//                 q_done.push_back(npu_done_task_t{task.i, task.j, task.k, task.n_i, task.n, slot, out_ptr});
+//             }
+//             cv_done.notify_one();
+//         }
+
+//         npu_done.store(true, std::memory_order_release);
+//         cv_done.notify_all();
+//     });
+
+//     std::thread threadC([&]() {
+//         while (!abort_pipeline.load(std::memory_order_relaxed)) {
+//             npu_done_task_t done_task = {};
+//             {
+//                 std::unique_lock<std::mutex> lk(m_done);
+//                 cv_done.wait(lk, [&]() {
+//                     return abort_pipeline.load(std::memory_order_relaxed) || !q_done.empty() || npu_done.load(std::memory_order_acquire);
+//                 });
+//                 if (abort_pipeline.load(std::memory_order_relaxed)) {
+//                     break;
+//                 }
+//                 if (q_done.empty()) {
+//                     break;
+//                 }
+//                 done_task = q_done.front();
+//                 q_done.pop_front();
+//             }
+
+//             auto cpu_s = ggml_time_us();
+//             consume_fp16_output(done_task.i, done_task.j, done_task.n_i, done_task.n, done_task.output);
+//             auto cpu_e = ggml_time_us();
+//             cpu_time_acc.fetch_add((uint64_t) (cpu_e - cpu_s), std::memory_order_relaxed);
+//             task_count_acc.fetch_add(1, std::memory_order_relaxed);
+
+//             {
+//                 std::lock_guard<std::mutex> lk(m_slots);
+//                 q_free_slots.push_back(done_task.slot);
+//             }
+//             cv_slots.notify_one();
+//         }
+//     });
+
+//     threadA.join();
+//     threadB.join();
+//     threadC.join();
+
+//     g_fp16_output_stride_override.store(0, std::memory_order_relaxed);
+
+//     if (abort_pipeline.load(std::memory_order_relaxed)) {
+//         throw std::runtime_error(err_msg.empty() ? "pipeline aborted" : err_msg);
+//     }
+
+//     layout_time += layout_time_acc.load(std::memory_order_relaxed);
+//     npu_time += npu_time_acc.load(std::memory_order_relaxed);
+//     cpu_time += cpu_time_acc.load(std::memory_order_relaxed);
+//     task_count += task_count_acc.load(std::memory_order_relaxed);
+
+//     auto convert_e_time = ggml_time_us();
+//     std::cout << "Tasks submit(inline pipeline): " << task_count << std::endl;
+//     std::cout << "Total inline pipeline time: " << (convert_e_time - convert_s_time) / 1000.0 << " ms" << std::endl;
+//     std::cout << "Total layout time: " << layout_time / 1000.0 << " ms" << std::endl;
+//     std::cout << "Total NPU submit+run time: " << npu_time / 1000.0 << " ms" << std::endl;
+//     std::cout << "Total CPU consume time: " << cpu_time / 1000.0 << " ms" << std::endl;
+// }
+
 static void compute_matmul_fp16_parallel_dynamic(
     const struct ggml_tensor* src0,  // weight (M x K, Q8_0, pre-quantized with IOMMU)
     const struct ggml_tensor* src1,  // input (N x K, FP32)
@@ -2136,8 +2676,6 @@ static void compute_matmul_fp16_parallel_dynamic(
     std::cout << "Total NPU submit+run time: " << npu_time / 1000.0 << " ms" << std::endl;
     std::cout << "Total CPU consume time: " << cpu_time / 1000.0 << " ms" << std::endl;
 }
-
-
 
 /**
  * @brief Q8_0 matrix multiplication with CPU & NPU parallel execution
@@ -2655,12 +3193,7 @@ static void compute_matmul_q8_0_parallel(
 
     auto start_time = ggml_time_us();
 
-    std::vector<block_q8_0_512> input_q8((N * K) / QK);
-    quantize_row_q8_0_custom<QK>((const float*) src1->data, input_q8.data(), N * K);
-
-    std::vector<int8_t> input_int8(N * K, 0);
-    std::vector<float> input_scales(N * K / QK, 0);
-    extract_q8_0_custom<QK>(input_q8.data(), N * K, input_int8.data(), input_scales.data());
+    const float * src1_f32 = (const float *) src1->data;
 
     const int max_k_in_blk = (BLOCK_SHARED + 15) & ~15;
     const size_t max_input_bytes = (size_t) N * max_k_in_blk;
@@ -2707,7 +3240,16 @@ static void compute_matmul_q8_0_parallel(
         size_t input_bytes;
         uint64_t input_dma;
         uint64_t weight_dma;
-        std::vector<int8_t> input_layout;
+        std::shared_ptr<std::vector<int8_t>> input_layout;
+        std::shared_ptr<std::vector<float>> input_scales_block;
+    };
+
+    struct prepared_input_q8_t {
+        int k;
+        int k_blk;
+        size_t input_bytes;
+        std::shared_ptr<std::vector<int8_t>> input_layout;
+        std::shared_ptr<std::vector<float>> input_scales_block;
     };
 
     struct npu_done_task_t {
@@ -2747,7 +3289,7 @@ static void compute_matmul_q8_0_parallel(
                     }
                 }
 
-                const float i_scale = input_scales[i * scale_per_k + k_scale_idx];
+                const float i_scale = (*(meta.input_scales_block))[(size_t) i];
                 const float32x4_t v_i_scale = vdupq_n_f32(i_scale);
                 const float32x4_t combined = vmulq_f32(v_i_scale, w_scale);
 
@@ -2807,41 +3349,75 @@ static void compute_matmul_q8_0_parallel(
     std::atomic<uint64_t> cpu_time_acc{0};
     std::atomic<int> task_count_acc{0};
 
+    std::vector<int> input_layout_indices((size_t) N * (size_t) QK);
+    for (int i = 0; i < N; ++i) {
+        for (int koff = 0; koff < QK; ++koff) {
+            input_layout_indices[(size_t) i * (size_t) QK + (size_t) koff] = feature_data(N, 16, koff, i);
+        }
+    }
+
     std::thread threadA([&]() {
         auto t0 = ggml_time_us();
-        for (int j = 0; j < M && !abort_pipeline.load(std::memory_order_relaxed); j += BLOCK_WEIGHT) {
-            const int _n = std::min(M - j, BLOCK_WEIGHT);
-            uint64_t cur_weight_dma = weight_dma_base + (uint64_t) j * K;
+        for (int k = 0; k < K && !abort_pipeline.load(std::memory_order_relaxed); k += BLOCK_SHARED) {
+            const int _k = std::min(K - k, BLOCK_SHARED);
+            if (_k != QK) {
+                set_error("Q8_0 pipeline expects BLOCK_SHARED == QK == 512");
+                break;
+            }
 
-            for (int k = 0; k < K && !abort_pipeline.load(std::memory_order_relaxed); k += BLOCK_SHARED) {
-                const int _k = std::min(K - k, BLOCK_SHARED);
-                const int _k_in = (_k + 15) & ~15;
-                std::vector<int8_t> input_layout((size_t) N * _k_in, 0);
+            const int _k_in = (_k + 15) & ~15;
+            auto input_layout = std::make_shared<std::vector<int8_t>>((size_t) N * _k_in, (int8_t) 0);
+            auto input_scales_block = std::make_shared<std::vector<float>>((size_t) N, 0.0f);
+            std::array<int8_t, QK> qbuf;
 
-                for (int i = 0; i < N; ++i) {
-                    for (int koff = 0; koff < _k; ++koff) {
-                        const int target = feature_data(N, 16, koff, i);
-                        input_layout[(size_t) target] = input_int8[(size_t) i * K + (k + koff)];
-                    }
+            for (int i = 0; i < N; ++i) {
+                const float * row_ptr = src1_f32 + (size_t) i * K + k;
+                const float amax = absmax_f32_fast(row_ptr, _k);
+
+                const float d = amax / 127.0f;
+                const float id = d > 0.0f ? (1.0f / d) : 0.0f;
+                (*input_scales_block)[(size_t) i] = d;
+
+                if (id == 0.0f) {
+                    std::memset(qbuf.data(), 0, (size_t) _k);
+                } else {
+                    quantize_row_q8_neon_fast(row_ptr, _k, id, qbuf.data());
                 }
 
+                const int * layout_map = &input_layout_indices[(size_t) i * (size_t) QK];
+                for (int koff = 0; koff < _k; ++koff) {
+                    (*input_layout)[(size_t) layout_map[koff]] = qbuf[(size_t) koff];
+                }
+            }
+
+            prepared_input_q8_t in = {
+                k,
+                _k,
+                (size_t) N * _k_in,
+                std::move(input_layout),
+                std::move(input_scales_block),
+            };
+
+            // Keep k as the fast-varying grouping key so threadB can reuse one input DMA copy
+            // across all j blocks of the same k block.
+            for (int j = 0; j < M && !abort_pipeline.load(std::memory_order_relaxed); j += BLOCK_WEIGHT) {
+                const int _n = std::min(M - j, BLOCK_WEIGHT);
                 prepared_task_t task = {
                     j,
-                    k,
+                    in.k,
                     _n,
-                    _k,
-                    (size_t) N * _k_in,
+                    in.k_blk,
+                    in.input_bytes,
                     input_dma_base,
-                    cur_weight_dma,
-                    std::move(input_layout),
+                    weight_dma_base + (uint64_t) j * K + (uint64_t) in.k * _n,
+                    in.input_layout,
+                    in.input_scales_block,
                 };
                 {
                     std::lock_guard<std::mutex> lk(m_prepared);
                     q_prepared.push_back(std::move(task));
                 }
                 cv_prepared.notify_one();
-
-                cur_weight_dma += (uint64_t) _k * _n;
             }
         }
         auto t1 = ggml_time_us();
@@ -2851,6 +3427,7 @@ static void compute_matmul_q8_0_parallel(
     });
 
     std::thread threadB([&]() {
+        const std::vector<int8_t> * last_input_layout = nullptr;
         while (!abort_pipeline.load(std::memory_order_relaxed)) {
             prepared_task_t task = {};
             {
@@ -2882,8 +3459,12 @@ static void compute_matmul_q8_0_parallel(
             }
 
             rknpu_tasks_t one_task = {};
-            memcpy(domain0->input->virtual_addr, task.input_layout.data(), task.input_bytes);
-            flush_cache(domain0->input->virtual_addr, task.input_bytes);
+            const std::vector<int8_t> * cur_input_layout = task.input_layout.get();
+            if (cur_input_layout != last_input_layout) {
+                memcpy(domain0->input->virtual_addr, task.input_layout->data(), task.input_bytes);
+                flush_cache(domain0->input->virtual_addr, task.input_bytes);
+                last_input_layout = cur_input_layout;
+            }
 
             one_task.tasks[0] = matmul_task_t{
                 task.input_dma,
